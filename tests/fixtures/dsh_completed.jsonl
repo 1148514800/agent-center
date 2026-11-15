@@ -1,0 +1,4 @@
+{"type":"session","sessionId":"synthetic-session"}
+{"type":"status","status":"running"}
+{"type":"text","text":"Synthetic fixture only."}
+{"type":"final","sessionId":"synthetic-session","reason":{"kind":"completed"},"text":"Synthetic task report; no real task was executed."}

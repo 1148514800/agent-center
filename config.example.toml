@@ -1,0 +1,71 @@
+schema_version = 1
+
+[app]
+data_dir = "~/.agent-center"
+default_workspace_root = "~/.agent-center/workspaces"
+
+[supervisor]
+protocol = "openai_chat_completions"
+base_url_env = "AGENT_CENTER_BASE_URL"
+api_key_env = "AGENT_CENTER_API_KEY"
+model = "REPLACE_WITH_AVAILABLE_MODEL_ID"
+request_timeout_seconds = 120
+max_output_tokens = 4096
+reasoning_effort = "" # Reserved; unsupported settings are rejected by the API adapter.
+
+[limits]
+max_agent_calls = 12
+max_supervisor_calls = 40
+max_step_retries = 2
+per_run_timeout_seconds = 900
+max_active_seconds = 3600
+termination_grace_seconds = 5
+max_log_bytes_per_run = 52428800
+max_model_input_bytes = 131072
+
+[policy]
+default_mode = "workspace-write"
+approval_default = "deny"
+allow_workspace_write = false
+allow_unverified_capabilities = false
+allow_full_access = false
+allow_global_install = false
+allow_external_publish = false
+
+[agents.codex]
+enabled = true
+adapter = "codex_exec"
+executable = "codex"
+description = "Codex exec JSONL adapter. This profile remains disabled until local safety probes are completed."
+default_profile = "codex_default"
+capability_status = "unverified"
+allow_execution = false
+write_sandbox_verified = false
+
+[agents.deepseek]
+enabled = true
+adapter = "deepseek_headless"
+executable = "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness"
+cli_install_dir = "/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh"
+description = "DeepSeek headless JSON adapter with a per-call central config overlay."
+default_profile = "deepseek_default"
+capability_status = "unverified"
+allow_execution = false
+write_sandbox_verified = false
+
+[profiles.codex_default]
+agent_id = "codex"
+model = "REPLACE_WITH_AVAILABLE_CODEX_MODEL_ID"
+auth_mode = "existing_cli"
+permission_mode = "read-only"
+reasoning_effort = ""
+credential_env = ["CODEX_HOME"]
+
+[profiles.deepseek_default]
+agent_id = "deepseek"
+provider = "deepseek-official"
+model = "REPLACE_WITH_AVAILABLE_DEEPSEEK_ROUTE_ID"
+auth_mode = "existing_cli"
+permission_mode = "read-only"
+reasoning_effort = ""
+credential_env = ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"]
