@@ -52,6 +52,9 @@ def parser() -> argparse.ArgumentParser:
     sub = result.add_subparsers(dest="command", required=True)
     doctor = sub.add_parser("doctor", help="Static local compatibility and configuration checks")
     doctor.add_argument("--live", action="store_true", help="Make one real low-token supervisor API request")
+    web = sub.add_parser("web", help="Open the local browser interface")
+    web.add_argument("--port", type=int, default=8765)
+    web.add_argument("--no-browser", action="store_true")
     sub.add_parser("agents", help="Show configured agent adapters and compatibility status")
     run = sub.add_parser("run", help="Create one task and execute the coordinator")
     run.add_argument("goal")
@@ -407,7 +410,7 @@ def main() -> None:
     try:
         config = _load_configuration(args)
     except Exception as exc:
-        if args.command == "doctor":
+        if args.command in {"doctor", "web"}:
             print(f"Configuration: NOT_CONFIGURED ({type(exc).__name__})")
             config = offline_default_configuration()
         elif args.command == "agents":
@@ -416,6 +419,8 @@ def main() -> None:
         else:
             print(f"Configuration error: {type(exc).__name__}: {redact_text(str(exc))}", file=sys.stderr)
             raise SystemExit(EXIT_CONFIG) from exc
+    if args.data_dir:
+        config = config.model_copy(update={"app": config.app.model_copy(update={"data_dir": str(args.data_dir)})})
     if args.command == "doctor":
         raise SystemExit(_doctor(config, config_path, live=args.live))
     if args.command == "agents":
@@ -427,6 +432,14 @@ def main() -> None:
         print(f"Cannot open local state: {redact_text(str(exc))}", file=sys.stderr)
         raise SystemExit(EXIT_BLOCKED) from exc
     try:
+        if args.command == "web":
+            from agent_center.web_server import serve
+
+            try:
+                asyncio.run(serve(engine, store, args.port, open_browser=not args.no_browser))
+            except KeyboardInterrupt:
+                print("Web server stopped; task state preserved.")
+            return
         if args.command == "history":
             print(json.dumps(store.list_tasks(), ensure_ascii=False, indent=2))
             raise SystemExit(EXIT_OK)
