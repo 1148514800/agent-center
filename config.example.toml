@@ -42,6 +42,22 @@ capability_status = "unverified"
 allow_execution = false
 write_sandbox_verified = false
 
+
+# Legacy capability_status/write_sandbox_verified are compatibility metadata only.
+# No capability becomes executable without a current installation identity and reviewed evidence.
+[agents.codex.capabilities]
+command_execution_supported = "UNVERIFIED"
+read_only_supported = "UNVERIFIED"
+workspace_write_supported = "UNVERIFIED"
+filesystem_read_boundary_verified = "UNSUPPORTED"
+filesystem_write_boundary_verified = "UNVERIFIED"
+network_boundary_verified = "UNVERIFIED"
+approval_response_supported = "UNSUPPORTED"
+structured_command_exit_verified = "UNVERIFIED"
+cancellation_verified = "UNVERIFIED"
+installation_identity = ""
+evidence_reference = ""
+
 [agents.deepseek]
 enabled = true
 adapter = "deepseek_headless"
@@ -52,6 +68,22 @@ default_profile = "deepseek_default"
 capability_status = "unverified"
 allow_execution = false
 write_sandbox_verified = false
+
+
+# Legacy capability_status/write_sandbox_verified are compatibility metadata only.
+# No capability becomes executable without a current installation identity and reviewed evidence.
+[agents.deepseek.capabilities]
+command_execution_supported = "UNVERIFIED"
+read_only_supported = "UNVERIFIED"
+workspace_write_supported = "UNVERIFIED"
+filesystem_read_boundary_verified = "UNSUPPORTED"
+filesystem_write_boundary_verified = "UNVERIFIED"
+network_boundary_verified = "UNSUPPORTED"
+approval_response_supported = "UNSUPPORTED"
+structured_command_exit_verified = "UNSUPPORTED"
+cancellation_verified = "UNVERIFIED"
+installation_identity = ""
+evidence_reference = ""
 
 [profiles.codex_default]
 agent_id = "codex"

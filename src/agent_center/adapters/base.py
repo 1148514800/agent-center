@@ -22,6 +22,7 @@ class AgentRequest:
     timeout_seconds: int
     log_dir: Path
     approved_scopes: tuple[str, ...] = ()
+    verification_command: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -34,12 +35,25 @@ class NormalizedEvent:
 
 
 @dataclass(frozen=True)
+class CommandExecution:
+    command: str
+    cwd: str | None
+    exit_code: int | None
+    status: str
+    output: str | None
+    event_id: str
+    finished: bool
+
+
+@dataclass(frozen=True)
 class AgentRunResult:
     process: ProcessResult
     events: tuple[NormalizedEvent, ...]
     completed: bool
     error: str | None
     final_text: str
+    commands: tuple[CommandExecution, ...] = ()
+    approval_requests: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -63,6 +77,8 @@ def parse_jsonl(path: Path) -> tuple[dict[str, Any], ...]:
         for index, line in enumerate(stream, start=1):
             if not line.strip():
                 continue
+            if not line.endswith(b"\n"):
+                raise ValueError(f"Truncated JSONL event on line {index}")
             try:
                 obj = json.loads(line)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -71,3 +87,17 @@ def parse_jsonl(path: Path) -> tuple[dict[str, Any], ...]:
                 raise ValueError(f"Non-object JSONL event on line {index}")
             events.append(obj)
     return tuple(events)
+
+
+def verification_prompt(request: AgentRequest) -> str:
+    if not request.verification_command:
+        return ""
+    import shlex
+
+    return (
+        "\nIndependent verification Run. Execute exactly this saved Plan command once, using the "
+        "foreground command tool and the explicit absolute workdir below. Do not edit files, add "
+        "commands, retry with broader permissions, use background jobs, or substitute tools. "
+        "If denied, stop and report the permission request.\n"
+        f"workdir: {request.workspace}\ncommand: {shlex.join(request.verification_command)}\n"
+    )

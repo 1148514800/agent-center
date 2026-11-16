@@ -8,6 +8,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from agent_center.capabilities import AgentCapabilities
+
 
 class StrictConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -43,7 +45,6 @@ class PolicyConfig(StrictConfig):
     default_mode: Literal["workspace-write", "read-only"] = "workspace-write"
     approval_default: Literal["deny"] = "deny"
     allow_workspace_write: bool = False
-    allow_unconfined_test_execution: bool = False
     allow_unverified_capabilities: Literal[False] = False
     allow_full_access: Literal[False] = False
     allow_global_install: Literal[False] = False
@@ -59,7 +60,8 @@ class AgentConfig(StrictConfig):
     cli_install_dir: str = ""
     capability_status: Literal["supported", "unsupported", "unverified"] = "unverified"
     allow_execution: bool = False
-    write_sandbox_verified: bool = False
+    write_sandbox_verified: bool = False  # Legacy metadata; never authorizes execution.
+    capabilities: AgentCapabilities = Field(default_factory=AgentCapabilities)
 
 
 class ProfileConfig(StrictConfig):

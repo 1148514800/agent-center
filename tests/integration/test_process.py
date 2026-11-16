@@ -89,3 +89,26 @@ async def test_output_limit_marks_truncation(tmp_path: Path) -> None:
     )
     assert result.truncated
     assert len(out.read_bytes()) + len(err.read_bytes()) <= 4096
+
+
+async def test_cancel_reaps_cli_process(tmp_path: Path) -> None:
+    import asyncio
+
+    ready = asyncio.Event()
+    running = asyncio.create_task(
+        ProcessRunner(termination_grace_seconds=1).run(
+            sys.executable,
+            ["-c", "import time; time.sleep(30)"],
+            cwd=tmp_path,
+            env={"PATH": "/usr/bin:/bin"},
+            stdin=b"",
+            timeout=40,
+            stdout_path=tmp_path / "out",
+            stderr_path=tmp_path / "err",
+            on_started=lambda pid: ready.set(),
+        )
+    )
+    await ready.wait()
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, timeout=5)

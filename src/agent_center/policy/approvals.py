@@ -10,10 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from agent_center.storage.database import Store, canonical, new_id, now
+from agent_center.storage.redaction import redact_text, redact_value
 
 
 class ApprovalManager:
-    """One-shot authorization bound to task requirements, config, and an exact workspace path."""
+    """Auditable one-shot decisions that never manufacture backend permissions."""
 
     def __init__(self, store: Store, secret_key: bytes):
         if len(secret_key) < 32:
@@ -21,7 +22,8 @@ class ApprovalManager:
         self.store = store
         self.secret_key = secret_key
 
-    def config_digest(self, config_snapshot: dict[str, Any]) -> str:
+    @staticmethod
+    def config_digest(config_snapshot: dict[str, Any]) -> str:
         return hashlib.sha256(canonical(config_snapshot).encode()).hexdigest()
 
     def create(
@@ -33,6 +35,7 @@ class ApprovalManager:
         target_path: Path,
         risk: str,
         *,
+        pending_action: dict[str, Any],
         ttl_seconds: int = 900,
     ) -> str:
         task = self.store.task(task_id)
@@ -41,8 +44,7 @@ class ApprovalManager:
         workspace = Path(task["workspace"]).resolve(strict=True)
         if not target_path.is_absolute():
             raise ValueError("Approval target must be an explicit absolute directory path")
-        target = target_path.expanduser().resolve(strict=False)
-        # Scope is directory-level, never a claimed single-command grant.
+        target = target_path.resolve(strict=False)
         try:
             target.relative_to(workspace)
         except ValueError as exc:
@@ -54,17 +56,20 @@ class ApprovalManager:
         expires_at = time.time() + ttl_seconds
         with self.store.transaction() as conn:
             task_row = conn.execute(
-                "SELECT requirements_version,status,config_snapshot FROM tasks WHERE task_id=?",
+                "SELECT requirements_version,status,config_snapshot,pending_approval_id FROM tasks WHERE task_id=?",
                 (task_id,),
             ).fetchone()
             pending_message = conn.execute(
-                "SELECT 1 FROM messages WHERE task_id=? AND applied_at IS NULL LIMIT 1",
-                (task_id,),
+                "SELECT 1 FROM messages WHERE task_id=? AND applied_at IS NULL LIMIT 1", (task_id,)
             ).fetchone()
             if task_row is None:
                 raise KeyError(task_id)
             if task_row[0] != requirements_version or pending_message:
                 raise ValueError("Approval scope is stale because requirements changed or are pending")
+            if task_row[3] is not None:
+                raise ValueError("Another approval request is already pending for this task")
+            if task_row[1] not in {"planning", "running", "waiting_approval"}:
+                raise ValueError("Task status does not permit a new approval request")
             if self.config_digest(json.loads(task_row[2])) != digest:
                 raise ValueError("Approval configuration snapshot does not match the task snapshot")
             conn.execute(
@@ -83,6 +88,21 @@ class ApprovalManager:
                     str(expires_at),
                 ),
             )
+            conn.execute(
+                "UPDATE tasks SET pending_approval_id=?,pending_action_json=?,status=?,"
+                "state_version=state_version+1,updated_at=? WHERE task_id=? "
+                "AND requirements_version=? AND pending_approval_id IS NULL",
+                (
+                    approval_id,
+                    redact_text(canonical(redact_value(pending_action))),
+                    "waiting_approval",
+                    now(),
+                    task_id,
+                    requirements_version,
+                ),
+            )
+            if conn.execute("SELECT changes()").fetchone()[0] != 1:
+                raise ValueError("Approval target task changed while saving request")
             self.store.emit(
                 conn,
                 task_id,
@@ -105,10 +125,10 @@ class ApprovalManager:
         return hmac.new(self.secret_key, message, hashlib.sha256).hexdigest()
 
     def decide(self, approval_id: str, decision: str, token: str, *, source: str) -> bool:
-        """Only a trusted local CLI/UI caller can access the signing key and produce this token."""
         expected = self.decision_token(approval_id, decision)
         if not hmac.compare_digest(expected, token):
-            raise PermissionError("Approval decision did not originate from the trusted user interface")
+            raise PermissionError("Approval decision did not originate from the trusted local interface")
+        self.store.expire_approvals()
         with self.store.transaction() as conn:
             row = conn.execute(
                 "SELECT task_id,requirements_version,config_hash,target_path,status,expires_at "
@@ -117,34 +137,70 @@ class ApprovalManager:
             ).fetchone()
             if row is None or row[4] != "pending":
                 return False
-            if float(row[5]) < time.time():
+            if float(row[5]) <= time.time():
                 conn.execute(
                     "UPDATE approvals SET status='expired',decision_at=?,decision_source='expired' WHERE approval_id=?",
                     (now(), approval_id),
                 )
+                conn.execute(
+                    "UPDATE tasks SET pending_approval_id=NULL,status=?,state_version=state_version+1,updated_at=? "
+                    "WHERE task_id=? AND pending_approval_id=?",
+                    ("planning", now(), row[0], approval_id),
+                )
                 self.store.emit(conn, row[0], "approval_expired", {"approval_id": approval_id})
                 return False
             task = conn.execute(
-                "SELECT requirements_version,config_snapshot FROM tasks WHERE task_id=?", (row[0],)
+                "SELECT requirements_version,config_snapshot,pending_approval_id FROM tasks WHERE task_id=?",
+                (row[0],),
             ).fetchone()
-            config_changed = (
+            pending_message = conn.execute(
+                "SELECT 1 FROM messages WHERE task_id=? AND applied_at IS NULL LIMIT 1",
+                (row[0],),
+            ).fetchone()
+            stale = (
                 task is None
                 or task[0] != row[1]
-                or self.config_digest(json.loads(task[1]) if task is not None else {}) != row[2]
+                or task[2] != approval_id
+                or pending_message is not None
+                or self.config_digest(json.loads(task[1]) if task else {}) != row[2]
             )
-            if config_changed:
+            if stale:
                 conn.execute(
                     "UPDATE approvals SET status='expired',decision_at=?,decision_source='scope_changed' "
                     "WHERE approval_id=?",
                     (now(), approval_id),
                 )
+                if task is not None and task[2] == approval_id:
+                    conn.execute(
+                        "UPDATE tasks SET pending_approval_id=NULL,pending_action_json=NULL,status=?,"
+                        "state_version=state_version+1,updated_at=? WHERE task_id=?",
+                        ("blocked", now(), row[0]),
+                    )
                 self.store.emit(conn, row[0], "approval_expired", {"approval_id": approval_id})
                 return False
             status = "approved" if decision == "approve" else "denied"
             conn.execute(
-                "UPDATE approvals SET status=?,decision_at=?,decision_source=? WHERE approval_id=?",
+                "UPDATE approvals SET status=?,decision_at=?,decision_source=? "
+                "WHERE approval_id=? AND status='pending'",
                 (status, now(), source, approval_id),
             )
+            task_status = "planning" if decision == "approve" else "blocked"
+            changed = conn.execute(
+                "UPDATE tasks SET status=?,pending_approval_id=CASE WHEN ?='denied' THEN NULL "
+                "ELSE pending_approval_id END,"
+                "pending_action_json=CASE WHEN ?='denied' THEN NULL ELSE pending_action_json END,"
+                "state_version=state_version+1,updated_at=? "
+                "WHERE task_id=? AND status='waiting_approval' AND pending_approval_id=?",
+                (task_status, status, status, now(), row[0], approval_id),
+            ).rowcount
+            if changed != 1:
+                conn.execute(
+                    "UPDATE approvals SET status='expired',decision_at=?,decision_source='task_state_changed' "
+                    "WHERE approval_id=?",
+                    (now(), approval_id),
+                )
+                self.store.emit(conn, row[0], "approval_expired", {"approval_id": approval_id})
+                return False
             self.store.emit(
                 conn,
                 row[0],
@@ -161,6 +217,7 @@ class ApprovalManager:
     def approved_scopes(
         self, task_id: str, requirements_version: int, config_snapshot: dict[str, Any]
     ) -> tuple[str, ...]:
+        self.store.expire_approvals()
         digest = self.config_digest(config_snapshot)
         rows = self.store._connection.execute(
             "SELECT target_path FROM approvals WHERE task_id=? AND requirements_version=? "
@@ -187,7 +244,7 @@ class ApprovalManager:
                 "UPDATE approvals SET status='expired' WHERE task_id=? AND status='approved'",
                 (task_id,),
             )
-            self.store.emit(conn, task_id, "approvals_invalidated", {"reason": "requirements_or_config_changed"})
+            self.store.emit(conn, task_id, "approvals_invalidated", {"reason": "scope_changed"})
 
 
 def create_signing_key(data_dir: Path) -> bytes:

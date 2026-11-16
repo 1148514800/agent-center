@@ -1,189 +1,303 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
-import sys
+import re
+import shlex
+import stat
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
-from agent_center.domain import Criterion
-from agent_center.runtime.process import ProcessRunner
+from agent_center.adapters.base import AgentRunResult
+from agent_center.capabilities import installation_identity, required_capabilities
+from agent_center.config import AppConfiguration
+from agent_center.domain import TaskStatus
 from agent_center.storage.database import Store
+
+VerificationLauncher = Callable[
+    [str, str, int, str, tuple[str, ...], asyncio.Event | None], Awaitable[tuple[str, AgentRunResult]]
+]
 
 
 class VerificationError(RuntimeError):
-    pass
+    """Raised when an independent verification cannot be safely performed."""
 
 
 class VerificationService:
-    """Run only saved, bounded test commands and bind evidence to workspace contents."""
+    """Coordinate independent Runs through native Agent CLIs; never execute project code."""
 
-    _IGNORED_DIRS = {".git", ".pytest_cache", "__pycache__", ".venv", "node_modules"}
     _MAX_FINGERPRINT_BYTES = 256 * 1024 * 1024
+    PYTEST_PREFIX = (
+        "/usr/bin/env",
+        "PYTEST_ADDOPTS=",
+        "PYTEST_PLUGINS=",
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD=1",
+        "python",
+        "-B",
+        "-m",
+        "pytest",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        "/dev/null",
+        "-o",
+        "addopts=",
+        "-q",
+    )
 
-    def __init__(self, store: Store, runner: ProcessRunner):
+    def __init__(
+        self, store: Store, config: AppConfiguration | None = None, launch: VerificationLauncher | None = None
+    ):
         self.store = store
-        self.runner = runner
+        self.config = config
+        self.launch = launch
 
     @classmethod
     def workspace_fingerprint(cls, workspace: Path) -> str:
         root = workspace.resolve(strict=True)
         digest = hashlib.sha256()
         consumed = 0
-        for current, dirs, files in os.walk(root, topdown=True, followlinks=False):
-            dirs[:] = sorted(name for name in dirs if name not in cls._IGNORED_DIRS)
-            for name in sorted(files):
-                path = Path(current) / name
-                relative = path.relative_to(root).as_posix()
-                if path.is_symlink():
-                    record = os.readlink(path).encode("utf-8", errors="replace")
-                    digest.update(b"L\0" + relative.encode() + b"\0" + record + b"\0")
-                    continue
-                if not path.is_file():
-                    continue
-                try:
-                    size = path.stat().st_size
-                    consumed += size
-                    if consumed > cls._MAX_FINGERPRINT_BYTES:
-                        raise VerificationError("workspace exceeds the evidence fingerprint byte limit")
-                    digest.update(b"F\0" + relative.encode("utf-8") + b"\0")
-                    with path.open("rb") as stream:
+        entries = 0
+
+        def unreadable(exc: OSError) -> None:
+            raise VerificationError("workspace contains an unreadable directory") from exc
+
+        def record(kind: str, relative: str, mode: int, value: str = "") -> None:
+            nonlocal entries
+            entries += 1
+            if entries > 100_000:
+                raise VerificationError("workspace exceeds the evidence fingerprint entry limit")
+            digest.update(json.dumps([kind, relative, mode, value], ensure_ascii=True).encode() + b"\n")
+
+        try:
+            for current, dirs, files in os.walk(root, topdown=True, followlinks=False, onerror=unreadable):
+                dirs.sort()
+                directory = Path(current)
+                if directory.is_symlink():
+                    raise VerificationError("workspace directory changed while fingerprinting")
+                record("D", directory.relative_to(root).as_posix(), directory.stat().st_mode)
+                links = [name for name in dirs if (directory / name).is_symlink()]
+                for name in sorted([*files, *links]):
+                    path = directory / name
+                    relative = path.relative_to(root).as_posix()
+                    info = path.lstat()
+                    if stat.S_ISLNK(info.st_mode):
+                        record("L", relative, info.st_mode, os.readlink(path))
+                        continue
+                    if not stat.S_ISREG(info.st_mode):
+                        raise VerificationError("workspace contains an unsupported special file")
+                    file_digest = hashlib.sha256()
+                    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "rb") as stream:
+                        before = os.fstat(stream.fileno())
                         while chunk := stream.read(1024 * 1024):
-                            digest.update(chunk)
-                    digest.update(b"\0")
-                except OSError as exc:
-                    raise VerificationError("workspace changed while its evidence fingerprint was read") from exc
+                            consumed += len(chunk)
+                            if consumed > cls._MAX_FINGERPRINT_BYTES:
+                                raise VerificationError("workspace exceeds the evidence fingerprint byte limit")
+                            file_digest.update(chunk)
+                        after = os.fstat(stream.fileno())
+                    if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_mode) != (
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_mode,
+                    ):
+                        raise VerificationError("workspace changed while fingerprinting")
+                    record("F", relative, after.st_mode, file_digest.hexdigest())
+        except OSError as exc:
+            raise VerificationError("workspace changed or could not be read while fingerprinting") from exc
         return digest.hexdigest()
 
-    def _resolve_argv(self, argv: list[str], workspace: Path) -> list[str]:
-        if len(argv) < 4 or len(argv) > 10:
-            raise VerificationError("verification command shape is invalid")
-        if any("\n" in arg or "\x00" in arg for arg in argv):
-            raise VerificationError("control characters are not allowed")
-        if Path(argv[0]).name not in {"pytest", "python", "python3", "python3.14"}:
-            raise VerificationError("verification is limited to the current Python pytest installation")
-        if Path(argv[0]).name == "pytest":
-            pytest_args = argv[1:]
-        elif argv[1:3] == ["-m", "pytest"]:
-            pytest_args = argv[3:]
-        else:
-            raise VerificationError("Python verification must use -m pytest")
-        # Preserve the venv path: resolving .venv/bin/python breaks pyvenv.cfg detection.
-        binary = Path(sys.executable)
-        if not pytest_args or pytest_args[0] not in {"-q", "--quiet"}:
-            raise VerificationError("pytest must use quiet mode")
-        test_args = pytest_args[1:]
-        if not test_args or any(arg.startswith("-") for arg in test_args):
-            raise VerificationError("pytest requires explicit test files and no other options")
-        resolved_files: list[str] = []
-        test_root = (workspace / "tests").resolve(strict=False)
-        for raw in test_args:
-            candidate = workspace / raw
-            path = candidate.resolve(strict=True)
-            try:
-                path.relative_to(test_root)
-            except ValueError as exc:
-                raise VerificationError("verification may only target explicit files under workspace/tests") from exc
-            if candidate.is_symlink() or not path.is_file() or not path.name.startswith("test_"):
-                raise VerificationError("verification target must be a regular test_*.py file")
-            if path.suffix != ".py":
-                raise VerificationError("only Python test files are accepted")
-            resolved_files.append(str(path.relative_to(workspace)))
-        return [str(binary), "-m", "pytest", "-q", "-p", "no:cacheprovider", *resolved_files]
+    @staticmethod
+    def plan_hash(task: dict[str, Any]) -> str:
+        return hashlib.sha256(task["plan_json"].encode()).hexdigest()
 
-    async def run_for_criteria(self, task_id: str, requirements_version: int, criteria_ids: list[str]) -> list[str]:
+    @staticmethod
+    def validate_command(argv: list[str], workspace: Path) -> tuple[str, ...]:
+        prefix = list(VerificationService.PYTEST_PREFIX)
+        if argv[: len(prefix)] != prefix or len(argv) <= len(prefix):
+            raise VerificationError("Plan must save the fixed pytest environment/config argv and explicit test files")
+        for name in argv[len(prefix) :]:
+            if not re.fullmatch(r"[A-Za-z0-9_./-]+\.py", name) or name.startswith(("-", "/")):
+                raise VerificationError("Only explicit relative Python test filenames are supported")
+            path = workspace / name
+            if ".." in Path(name).parts or any(p.is_symlink() for p in (path, *path.parents)):
+                raise VerificationError("Test paths cannot traverse symlinks or parent directories")
+            if not path.resolve(strict=True).is_relative_to(workspace) or not path.is_file():
+                raise VerificationError("Registered test file is outside the workspace or unavailable")
+        return tuple(argv)
+
+    async def run_for_criteria(
+        self,
+        task_id: str,
+        requirements_version: int,
+        criteria_ids: list[str],
+        *,
+        cancel_event: asyncio.Event | None = None,
+    ) -> list[str]:
         task = self.store.task(task_id)
-        if not task:
-            raise VerificationError("task does not exist")
-        plan = json.loads(task["plan_json"])
-        criteria = {
-            criterion["id"]: Criterion.model_validate(criterion)
-            for step in plan
-            for criterion in step["acceptance_criteria"]
-        }
-        if not criteria_ids or not set(criteria_ids).issubset(criteria):
-            raise VerificationError("criterion is not in the current plan")
+        if not task or task["requirements_version"] != requirements_version or self.store.pending_messages(task_id):
+            raise VerificationError("Verification requirements are stale or pending")
+        plan_hash = self.plan_hash(task)
+        criteria = {c["id"]: c for s in json.loads(task["plan_json"]) for c in s["acceptance_criteria"]}
+        if (
+            not criteria_ids
+            or len(set(criteria_ids)) != len(criteria_ids)
+            or any(c not in criteria for c in criteria_ids)
+        ):
+            raise VerificationError("Criterion IDs must belong to the current saved Plan")
+        if self.config is None or self.launch is None:
+            raise VerificationError("UNVERIFIED: native Agent verification launcher is not configured")
         workspace = Path(task["workspace"]).resolve(strict=True)
-        evidence_ids: list[str] = []
-        for criterion_id in sorted(set(criteria_ids)):
-            criterion = criteria[criterion_id]
-            argv = self._resolve_argv(criterion.verification_argv, workspace)
-            before_fingerprint = self.workspace_fingerprint(workspace)
-            log_dir = self.store.data_dir / "tasks" / task_id / "verification"
-            log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            run_id = f"verify_{os.urandom(6).hex()}"
-            stdout = log_dir / f"{run_id}.stdout"
-            stderr = log_dir / f"{run_id}.stderr"
-            result = await self.runner.run(
-                argv[0],
-                argv[1:],
-                cwd=workspace,
-                env={
-                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-                    "PYTHONPATH": str(workspace),
-                    "HOME": str(Path.home()),
-                    "LANG": "en_US.UTF-8",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                    "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
-                    "PYTEST_ADDOPTS": "",
-                    "TERM": "dumb",
-                },
-                stdin=b"",
-                timeout=300,
-                stdout_path=stdout,
-                stderr_path=stderr,
+        # Validate every command before reserving a call or creating a Run.
+        commands = {cid: self.validate_command(criteria[cid]["verification_argv"], workspace) for cid in criteria_ids}
+        selected: str | None = None
+        for agent_id, agent in self.config.agents.items():
+            profile = self.config.profiles[agent.default_profile]
+            if not agent.enabled or not agent.allow_execution or profile.permission_mode != "read-only":
+                continue
+            if agent.capabilities.permits(
+                installation_identity(agent, profile), required_capabilities("read-only", verification=True)
+            ):
+                selected = agent_id
+                break
+        if selected is None:
+            self.store.append_event(
+                task_id, "verification_unverified", {"status": "UNVERIFIED", "criteria": criteria_ids}
             )
-            if result.timed_out or result.truncated:
-                raise VerificationError(f"verification for {criterion_id} was truncated or timed out")
-            if result.returncode != 0:
-                raise VerificationError(f"verification for {criterion_id} exited with status {result.returncode}")
-            after_fingerprint = self.workspace_fingerprint(workspace)
-            if before_fingerprint != after_fingerprint:
-                raise VerificationError(
-                    f"verification changed workspace files for {criterion_id}; result is not accepted"
-                )
-            body = (stdout.read_text(errors="replace") + "\n" + stderr.read_text(errors="replace"))[:6000]
-            digest = hashlib.sha256(body.encode()).hexdigest()
-            evidence_id = self.store.add_evidence(
+            raise VerificationError(
+                "UNVERIFIED: no Agent has current, verified native read-only verification capabilities"
+            )
+        agent = self.config.agents[selected]
+        profile = self.config.profiles[agent.default_profile]
+        identity = installation_identity(agent, profile)
+        evidence_ids: list[str] = []
+        for cid, command in commands.items():
+            current = self.store.task(task_id)
+            if (
+                not current
+                or current["requirements_version"] != requirements_version
+                or self.plan_hash(current) != plan_hash
+                or self.store.pending_messages(task_id)
+            ):
+                raise VerificationError("Plan changed before verification")
+            before = self.workspace_fingerprint(workspace)
+            run_id, result = await self.launch(task_id, selected, requirements_version, cid, command, cancel_event)
+            after = self.workspace_fingerprint(workspace)
+            current = self.store.task(task_id)
+            stable = bool(
+                current
+                and current["requirements_version"] == requirements_version
+                and self.plan_hash(current) == plan_hash
+                and not self.store.pending_messages(task_id)
+                and before == after
+                and installation_identity(agent, profile) == identity
+            )
+            status = self.command_status(result, command, workspace) if stable else "UNVERIFIED"
+            command_details = []
+            for executed in result.commands:
+                detail = asdict(executed)
+                if executed.output is not None:
+                    detail["output_sha256"] = hashlib.sha256(executed.output.encode()).hexdigest()
+                    detail["output"] = executed.output[:8000]
+                command_details.append(detail)
+            details = {
+                "status": status,
+                "criterion_id": cid,
+                "argv": command,
+                "cwd": str(workspace),
+                "process_exit": result.process.returncode,
+                "error": result.error,
+                "commands": command_details,
+            }
+            eid = self.store.add_evidence(
                 task_id,
                 requirements_version,
                 "verification",
-                f"criterion={criterion_id}; command={argv}; exit=0; output_sha256={digest}; "
-                f"workspace_sha256={after_fingerprint}; output={body}",
+                json.dumps(details, ensure_ascii=False),
                 run_id=run_id,
-                path=str(stdout),
-                sha256=digest,
-                workspace_sha256=after_fingerprint,
-                complete=True,
+                complete=status == "PASSED",
+                workspace_sha256=after,
+                plan_sha256=plan_hash,
+                capability_identity=identity,
+                verification_status=status,
             )
-            self.store.link_evidence_criteria(evidence_id, [criterion_id])
-            self.store.append_event(
-                task_id,
-                "verification_run",
-                {
-                    "evidence_id": evidence_id,
-                    "criterion_id": criterion_id,
-                    "argv": argv,
-                    "exit_code": 0,
-                    "requirements_version": requirements_version,
-                    "workspace_sha256": after_fingerprint,
-                },
-            )
-            evidence_ids.append(evidence_id)
+            self.store.link_evidence_criteria(eid, [cid])
+            evidence_ids.append(eid)
+            if status == "UNVERIFIED":
+                raise VerificationError(
+                    f"{status}: native execution evidence did not prove criterion {cid}; run={run_id}"
+                )
+            self.store.set_status(task_id, TaskStatus.VERIFYING)
         return evidence_ids
+
+    @staticmethod
+    def command_status(result: AgentRunResult, command: tuple[str, ...], workspace: Path) -> str:
+        if (
+            not result.completed
+            or result.process.returncode != 0
+            or result.process.timed_out
+            or result.process.cancelled
+            or result.process.truncated
+            or result.approval_requests
+        ):
+            return "UNVERIFIED"
+        # Additional tool commands, shell wrappers, inferred cwd, or text reports cannot attest a criterion.
+        if len(result.commands) != 1:
+            return "UNVERIFIED"
+        for event in result.events:
+            if event.kind == "item.completed":
+                item = event.raw.get("item", {})
+                if item.get("type") not in {"command_execution", "agent_message", "assistant_message", "reasoning"}:
+                    return "UNVERIFIED"
+        actual = result.commands[0]
+        matches = actual.command == shlex.join(command)
+        if (
+            not matches
+            or actual.cwd != str(workspace)
+            or not actual.finished
+            or actual.status != "completed"
+            or actual.exit_code is None
+            or actual.output is None
+            or not actual.event_id
+        ):
+            return "UNVERIFIED"
+        return "PASSED" if actual.exit_code == 0 else "FAILED"
 
     def is_fresh(self, task_id: str, evidence_ids: list[str]) -> bool:
         task = self.store.task(task_id)
-        if not task:
+        if not task or self.config is None or self.store.pending_messages(task_id):
             return False
         try:
             current = self.workspace_fingerprint(Path(task["workspace"]))
         except OSError, VerificationError:
             return False
         rows = {row["evidence_id"]: row for row in self.store.evidence(task_id)}
-        return all(
-            evidence_id in rows
-            and rows[evidence_id]["source"] == "verification"
-            and rows[evidence_id]["workspace_sha256"] == current
-            for evidence_id in evidence_ids
-        )
+        runs = {row["run_id"]: row for row in self.store.runs(task_id)}
+        for eid in evidence_ids:
+            row = rows.get(eid)
+            if (
+                not row
+                or not row["complete"]
+                or row["verification_status"] != "PASSED"
+                or row["requirements_version"] != task["requirements_version"]
+                or row["plan_sha256"] != self.plan_hash(task)
+                or row["workspace_sha256"] != current
+            ):
+                return False
+            run = runs.get(row["run_id"])
+            if not run or run["status"] != "completed" or run["exit_code"] != 0 or not run["event_complete"]:
+                return False
+            agent = self.config.agents.get(run["agent_id"])
+            if not agent or not agent.enabled or not agent.allow_execution:
+                return False
+            profile = self.config.profiles[agent.default_profile]
+            identity = installation_identity(agent, profile)
+            if row["capability_identity"] != identity or not agent.capabilities.permits(
+                identity, required_capabilities("read-only", verification=True)
+            ):
+                return False
+        return bool(evidence_ids)

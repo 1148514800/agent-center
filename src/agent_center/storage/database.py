@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import sqlite3
@@ -22,8 +23,9 @@ CREATE TABLE IF NOT EXISTS tasks(
  requirements_version INTEGER NOT NULL DEFAULT 1, state_version INTEGER NOT NULL DEFAULT 1,
  config_snapshot TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  agent_calls INTEGER NOT NULL DEFAULT 0, supervisor_calls INTEGER NOT NULL DEFAULT 0,
- active_seconds REAL NOT NULL DEFAULT 0, plan_json TEXT NOT NULL DEFAULT '[]',
- last_error TEXT, criteria_json TEXT NOT NULL DEFAULT '[]', execution_required INTEGER NOT NULL DEFAULT 0
+ active_seconds REAL NOT NULL DEFAULT 0, active_started_at REAL, plan_json TEXT NOT NULL DEFAULT '[]',
+ last_error TEXT, criteria_json TEXT NOT NULL DEFAULT '[]', execution_required INTEGER NOT NULL DEFAULT 0,
+ pending_approval_id TEXT, pending_action_json TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
  message_id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES tasks(task_id), sequence INTEGER NOT NULL,
@@ -81,62 +83,20 @@ def canonical(value: Any) -> str:
 def is_execution_request(goal: str) -> bool:
     """Default to execution-required; only unmistakable informational questions can answer directly."""
     text = goal.strip().casefold()
-    execution_terms = (
-        "implement",
-        "build",
-        "create",
-        "write code",
-        "modify",
-        "change files",
-        "edit files",
-        "fix bug",
-        "fix test",
-        "run tests",
-        "add feature",
-        "develop",
-        "refactor",
-        "add test",
-        "delete",
-        "remove",
-        "push",
-        "deploy",
-        "publish",
-        "upload",
-        "send",
-        "install",
-        "开发",
-        "实现",
-        "编写",
-        "创建",
-        "修改",
-        "修复",
-        "增加",
-        "添加",
-        "测试",
-        "改代码",
-        "重构",
-        "构建项目",
-        "写程序",
-        "做一个",
-        "删除",
-        "推送",
-        "部署",
-        "发布",
-        "上传",
-        "安装",
-        "中控台",
-        "项目规划",
-        "验收清单",
-        "工作区",
-        "页面",
-        "网站",
-        "程序",
-    )
-    if any(term in text for term in execution_terms):
-        return True
     informational_prefixes = (
         "what is",
         "what are",
+        "what's",
+        "what was",
+        "what were",
+        "who was",
+        "where was",
+        "when was",
+        "how can i understand",
+        "how should i think about",
+        "tell me what",
+        "explain what",
+        "define what",
         "why is",
         "why are",
         "how does",
@@ -150,14 +110,46 @@ def is_execution_request(goal: str) -> bool:
         "compare ",
         "what does",
         "什么是",
+        "什么叫",
+        "是什么",
         "为什么",
+        "怎么回事",
+        "是什么原理",
+        "原理是什么",
         "怎么理解",
         "如何理解",
         "解释一下",
+        "请解释",
+        "请说明",
+        "请问",
         "说明一下",
         "区别是什么",
     )
-    return not text.startswith(informational_prefixes)
+    if text.startswith(informational_prefixes):
+        actionable = (
+            " and then implement",
+            " and fix",
+            " and update",
+            " to the project",
+            " in the project",
+            "write code",
+            "change files",
+            "edit files",
+            "modify files",
+            "run tests",
+            "并实现",
+            "并修改",
+            "并添加",
+            "并修复",
+            "帮我改",
+            "帮我做",
+            "请实现",
+            "请修改",
+            "请添加",
+            "请编写",
+        )
+        return any(marker in text for marker in actionable)
+    return True
 
 
 class WorkspaceLock:
@@ -203,9 +195,19 @@ class Store:
         columns = {row[1] for row in self._connection.execute("PRAGMA table_info(tasks)")}
         if "execution_required" not in columns:
             self._connection.execute("ALTER TABLE tasks ADD COLUMN execution_required INTEGER NOT NULL DEFAULT 0")
+        if "active_started_at" not in columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN active_started_at REAL")
+        if "pending_action_json" not in columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN pending_action_json TEXT")
+        if "pending_approval_id" not in columns:
+            self._connection.execute("ALTER TABLE tasks ADD COLUMN pending_approval_id TEXT")
         evidence_columns = {row[1] for row in self._connection.execute("PRAGMA table_info(evidence)")}
         if "workspace_sha256" not in evidence_columns:
             self._connection.execute("ALTER TABLE evidence ADD COLUMN workspace_sha256 TEXT")
+        for name in ("plan_sha256", "capability_identity", "verification_status"):
+            if name not in evidence_columns:
+                self._connection.execute(f"ALTER TABLE evidence ADD COLUMN {name} TEXT")
+        self._connection.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(5, ?)", (now(),))
         run_columns = {row[1] for row in self._connection.execute("PRAGMA table_info(runs)")}
         if "process_command_line" not in run_columns:
             self._connection.execute("ALTER TABLE runs ADD COLUMN process_command_line TEXT")
@@ -330,6 +332,27 @@ class Store:
                 "WHERE task_id=?",
                 (version, stamp, int(requires_execution), task_id),
             )
+            changed_approvals = conn.execute(
+                "SELECT approval_id FROM approvals WHERE task_id=? AND status IN ('pending','approved')",
+                (task_id,),
+            ).fetchall()
+            conn.execute(
+                "UPDATE approvals SET status='expired',decision_at=?,decision_source='requirements_changed' "
+                "WHERE task_id=? AND status IN ('pending','approved')",
+                (stamp, task_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET pending_approval_id=NULL,pending_action_json=NULL "
+                "WHERE task_id=? AND pending_approval_id IS NOT NULL",
+                (task_id,),
+            )
+            for approval_row in changed_approvals:
+                self.emit(
+                    conn,
+                    task_id,
+                    "approval_expired",
+                    {"approval_id": approval_row[0], "reason": "requirements_changed"},
+                )
             self.emit(
                 conn,
                 task_id,
@@ -338,13 +361,63 @@ class Store:
             )
             return int(version)
 
-    def set_status(self, task_id: str, status: TaskStatus, *, error: str | None = None) -> None:
+    def set_status(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        error: str | None = None,
+        pending_approval_id: str | None = None,
+        pending_action: dict[str, Any] | None = None,
+    ) -> None:
         with self.transaction() as conn:
             conn.execute(
-                "UPDATE tasks SET status=?,last_error=?,state_version=state_version+1,updated_at=? WHERE task_id=?",
-                (status, error, now(), task_id),
+                "UPDATE tasks SET status=?,last_error=?,pending_approval_id=COALESCE(?,pending_approval_id),"
+                "pending_action_json=COALESCE(?,pending_action_json),state_version=state_version+1,updated_at=? "
+                "WHERE task_id=?",
+                (
+                    status,
+                    error,
+                    pending_approval_id,
+                    redact_text(canonical(redact_value(pending_action))) if pending_action else None,
+                    now(),
+                    task_id,
+                ),
             )
             self.emit(conn, task_id, "task_status", {"status": status.value, "error": error})
+
+    def pending_approval(self, task_id: str) -> tuple[str, dict[str, Any]] | None:
+        row = self._connection.execute(
+            "SELECT pending_approval_id,pending_action_json FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None or row[0] is None or row[1] is None:
+            return None
+        return str(row[0]), json.loads(row[1])
+
+    def expire_approvals_for_task(self, task_id: str, reason: str) -> None:
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE approvals SET status='expired',decision_at=?,decision_source=? "
+                "WHERE task_id=? AND status IN ('pending','approved')",
+                (now(), reason, task_id),
+            )
+            self.emit(conn, task_id, "approvals_invalidated", {"reason": reason})
+
+    def clear_pending_approval(self, task_id: str, approval_id: str) -> None:
+        with self.transaction() as conn:
+            row = conn.execute("SELECT pending_approval_id,status FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row[0] != approval_id:
+                raise RuntimeError("Approval does not match the task's pending request")
+            conn.execute(
+                "UPDATE tasks SET pending_approval_id=NULL,pending_action_json=NULL,"
+                "state_version=state_version+1,updated_at=? "
+                "WHERE task_id=? AND pending_approval_id=?",
+                (now(), task_id, approval_id),
+            )
+            self.emit(conn, task_id, "pending_approval_cleared", {"approval_id": approval_id})
 
     def record_call(self, task_id: str, kind: str, limit: int) -> int:
         column = "agent_calls" if kind == "agent" else "supervisor_calls"
@@ -388,7 +461,7 @@ class Store:
             ).fetchone()
             if active:
                 raise RuntimeError("An unresolved run exists; reconcile it before starting another")
-            if task[1] not in {TaskStatus.PLANNING, TaskStatus.CREATED}:
+            if task[1] not in {TaskStatus.PLANNING, TaskStatus.CREATED, TaskStatus.VERIFYING}:
                 raise RuntimeError(f"Task status {task[1]} does not permit a new run; reconcile or re-plan first")
             if task[2] and not json.loads(task[3]):
                 raise RuntimeError("Execution task is missing a saved plan and verifiable criteria")
@@ -411,8 +484,9 @@ class Store:
                 ),
             )
             conn.execute(
-                "UPDATE tasks SET status=?,state_version=state_version+1,updated_at=? WHERE task_id=?",
-                (TaskStatus.RUNNING, now(), task_id),
+                "UPDATE tasks SET status=?,state_version=state_version+1,updated_at=?,"
+                "active_started_at=COALESCE(active_started_at,?) WHERE task_id=?",
+                (TaskStatus.RUNNING, now(), time.time(), task_id),
             )
             self.emit(
                 conn,
@@ -422,6 +496,72 @@ class Store:
                 run_id,
             )
         return run_id
+
+    def recover_stale_active_period(self, task_id: str) -> float:
+        """Conservatively charge elapsed wall-clock time if a process restarted mid-task."""
+        now_epoch = time.time()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT active_started_at,active_seconds FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row[0] is None:
+                return float(row[1])
+            elapsed = max(0.0, now_epoch - float(row[0]))
+            total = float(row[1]) + elapsed
+            conn.execute(
+                "UPDATE tasks SET active_seconds=?,active_started_at=NULL,updated_at=? WHERE task_id=?",
+                (total, now(), task_id),
+            )
+            self.emit(
+                conn,
+                task_id,
+                "stale_active_period_recovered",
+                {"charged_seconds": round(elapsed, 3), "total_seconds": round(total, 3)},
+            )
+            return total
+
+    def start_active_period(self, task_id: str) -> None:
+        with self.transaction() as conn:
+            row = conn.execute("SELECT active_started_at FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row[0] is None:
+                conn.execute(
+                    "UPDATE tasks SET active_started_at=?,updated_at=? WHERE task_id=?",
+                    (time.time(), now(), task_id),
+                )
+                self.emit(conn, task_id, "active_period_started", {})
+
+    def settle_active_period(self, task_id: str) -> float:
+        stamp = now()
+        current = time.time()
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT active_started_at,active_seconds FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(task_id)
+            if row[0] is None:
+                return float(row[1])
+            elapsed = max(0.0, current - float(row[0]))
+            total = float(row[1]) + elapsed
+            conn.execute(
+                "UPDATE tasks SET active_seconds=?,active_started_at=NULL,updated_at=? WHERE task_id=?",
+                (total, stamp, task_id),
+            )
+            self.emit(conn, task_id, "active_period_settled", {"seconds": round(elapsed, 3), "total": round(total, 3)})
+            return total
+
+    def active_seconds_now(self, task_id: str) -> float:
+        row = self._connection.execute(
+            "SELECT active_seconds,active_started_at FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(task_id)
+        active = max(0.0, time.time() - float(row[1])) if row[1] is not None else 0.0
+        return float(row[0]) + active
 
     def add_active_seconds(self, task_id: str, seconds: float) -> None:
         if seconds < 0 or not seconds < float("inf"):
@@ -500,6 +640,9 @@ class Store:
         sha256: str | None = None,
         workspace_sha256: str | None = None,
         complete: bool = True,
+        plan_sha256: str | None = None,
+        capability_identity: str | None = None,
+        verification_status: str | None = None,
     ) -> str:
         evidence_id = new_id("evd")
         with self.transaction() as conn:
@@ -520,6 +663,10 @@ class Store:
                     int(complete),
                     now(),
                 ),
+            )
+            conn.execute(
+                "UPDATE evidence SET plan_sha256=?,capability_identity=?,verification_status=? WHERE evidence_id=?",
+                (plan_sha256, capability_identity, verification_status, evidence_id),
             )
             self.emit(
                 conn,
@@ -552,7 +699,8 @@ class Store:
     ) -> bool:
         with self.transaction() as conn:
             task = conn.execute(
-                "SELECT requirements_version,status,execution_required,criteria_json FROM tasks WHERE task_id=?",
+                "SELECT requirements_version,status,execution_required,criteria_json,plan_json "
+                "FROM tasks WHERE task_id=?",
                 (task_id,),
             ).fetchone()
             pending = conn.execute(
@@ -562,11 +710,22 @@ class Store:
                 "SELECT 1 FROM runs WHERE task_id=? AND status IN ('prepared','starting','running','unknown') LIMIT 1",
                 (task_id,),
             ).fetchone()
-            conn.execute(
-                "UPDATE approvals SET status='expired',decision_at=?,decision_source='expired' "
-                "WHERE task_id=? AND status='pending' AND CAST(expires_at AS REAL)<=?",
-                (now(), task_id, time.time()),
-            )
+            expired = conn.execute(
+                "SELECT approval_id FROM approvals WHERE task_id=? AND status='pending' "
+                "AND CAST(expires_at AS REAL)<=?",
+                (task_id, time.time()),
+            ).fetchall()
+            for item in expired:
+                conn.execute(
+                    "UPDATE approvals SET status='expired',decision_at=?,decision_source='expired' WHERE approval_id=?",
+                    (now(), item[0]),
+                )
+                conn.execute(
+                    "UPDATE tasks SET pending_approval_id=NULL,pending_action_json=NULL,status=?,"
+                    "state_version=state_version+1,updated_at=? WHERE task_id=? AND pending_approval_id=?",
+                    (TaskStatus.BLOCKED, now(), task_id, item[0]),
+                )
+                self.emit(conn, task_id, "approval_expired", {"approval_id": item[0]})
             approval = conn.execute(
                 "SELECT 1 FROM approvals WHERE task_id=? AND status='pending' LIMIT 1", (task_id,)
             ).fetchone()
@@ -597,7 +756,8 @@ class Store:
                 fingerprint_evidence = conn.execute(
                     f"SELECT COUNT(*) FROM evidence WHERE task_id=? AND requirements_version=? "
                     f"AND evidence_id IN ({placeholders}) AND source='verification' "
-                    f"AND workspace_sha256 IS NOT NULL",
+                    f"AND workspace_sha256 IS NOT NULL AND plan_sha256 IS NOT NULL "
+                    f"AND capability_identity IS NOT NULL AND verification_status='PASSED'",
                     (task_id, requirements_version, *evidence_ids),
                 ).fetchone()[0]
                 if fingerprint_evidence < len(required):
@@ -606,8 +766,19 @@ class Store:
                 satisfied = conn.execute(
                     f"SELECT 1 FROM evidence e JOIN evidence_criteria ec ON ec.evidence_id=e.evidence_id "
                     f"WHERE e.task_id=? AND e.requirements_version=? AND e.complete=1 "
+                    f"AND e.source='verification' AND e.verification_status='PASSED' AND e.plan_sha256=? "
+                    f"AND e.workspace_sha256 IS NOT NULL AND length(e.capability_identity)>0 "
+                    f"AND EXISTS (SELECT 1 FROM runs r WHERE r.run_id=e.run_id AND r.task_id=e.task_id "
+                    f"AND r.requirements_version=e.requirements_version AND r.status='completed' "
+                    f"AND r.exit_code=0 AND r.event_complete=1) "
                     f"AND e.evidence_id IN ({placeholders}) AND ec.criterion_id=? LIMIT 1",
-                    (task_id, requirements_version, *evidence_ids, criterion_id),
+                    (
+                        task_id,
+                        requirements_version,
+                        hashlib.sha256(task[4].encode()).hexdigest(),
+                        *evidence_ids,
+                        criterion_id,
+                    ),
                 ).fetchone()
                 if not satisfied:
                     return False
@@ -678,7 +849,10 @@ class Store:
             self.emit(conn, task_id, event_type, payload, run_id)
 
     def update_plan(self, task_id: str, plan: list[dict[str, Any]], requirements_version: int) -> None:
-        criteria = sorted({criterion["id"] for step in plan for criterion in step["acceptance_criteria"]})
+        all_criteria = [criterion["id"] for step in plan for criterion in step["acceptance_criteria"]]
+        if len(set(all_criteria)) != len(all_criteria):
+            raise ValueError("Plan criterion IDs must be globally unique")
+        criteria = sorted(all_criteria)
         with self.transaction() as conn:
             row = conn.execute("SELECT requirements_version FROM tasks WHERE task_id=?", (task_id,)).fetchone()
             pending = conn.execute(
@@ -720,6 +894,11 @@ class Store:
                 conn.execute(
                     "UPDATE approvals SET status='expired',decision_at=?,decision_source='expired' WHERE approval_id=?",
                     (stamp, row[0]),
+                )
+                conn.execute(
+                    "UPDATE tasks SET pending_approval_id=NULL,pending_action_json=NULL,status=?,"
+                    "state_version=state_version+1,updated_at=? WHERE task_id=? AND pending_approval_id=?",
+                    (TaskStatus.BLOCKED, stamp, row[1], row[0]),
                 )
                 self.emit(conn, row[1], "approval_expired", {"approval_id": row[0]})
             return len(rows)

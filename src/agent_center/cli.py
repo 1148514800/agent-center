@@ -15,12 +15,14 @@ from prompt_toolkit import PromptSession
 from prompt_toolkit.patch_stdout import patch_stdout
 
 from agent_center import __version__
+from agent_center.capabilities import installation_identity, required_capabilities
 from agent_center.config import (
     AppConfiguration,
     default_config_path,
     load_config,
     offline_default_configuration,
 )
+from agent_center.domain import TaskStatus
 from agent_center.engine import TaskEngine
 from agent_center.policy.approvals import ApprovalManager, create_signing_key
 from agent_center.runtime.identity import verify_process_identity
@@ -115,12 +117,17 @@ def _doctor(config: AppConfiguration, config_path: Path, *, live: bool) -> int:
             version = _bounded_command([executable, "--version"])
         elif agent.adapter == "deepseek_headless" and Path(executable).is_file():
             version = "Desktop launcher exists; headless help was statically verified separately"
-        state = agent.capability_status
+        profile = config.profiles[agent.default_profile]
+        current = agent.capabilities.permits(
+            installation_identity(agent, profile), required_capabilities(profile.permission_mode)
+        )
+        state = "SUPPORTED" if current else "UNVERIFIED"
         print(
             f"Agent {agent_id}: configured executable={executable}; version={version}; "
             f"capability={state}; execution_enabled={agent.allow_execution}"
         )
-        if state != "supported" or not agent.allow_execution:
+        print("  Native capability matrix: " + json.dumps(agent.capabilities.model_dump(mode="json")))
+        if not current or not agent.allow_execution:
             print("  Execution remains blocked by local config until safety/protocol checks are completed.")
     print(
         "Permission: full-access/global install/publish values are schema-forced false; "
@@ -181,9 +188,10 @@ def _agents(config: AppConfiguration) -> None:
         requested = f"{profile.provider + '/' if profile.provider else ''}{profile.model}"
         print(
             f"  requested model={requested}; permission={profile.permission_mode}; "
-            f"capability={agent.capability_status}; enabled={agent.enabled and agent.allow_execution}"
+            f"enabled={agent.enabled and agent.allow_execution}"
         )
-        print("  confirmed model=unknown; auth=unverified; safety boundaries=unverified")
+        print("  Native capability matrix: " + json.dumps(agent.capabilities.model_dump(mode="json")))
+        print("  confirmed model=unknown; auth=unverified; safety boundaries require installation-bound evidence")
 
 
 def _store_and_engine(config: AppConfiguration) -> tuple[Store, TaskEngine, WorkspaceLock]:
@@ -255,7 +263,7 @@ async def _run_command(engine: TaskEngine, store: Store, goal: str, workspace: P
     except asyncio.CancelledError:
         store.set_status(
             task_id,
-            __import__("agent_center.domain", fromlist=["TaskStatus"]).TaskStatus.INTERRUPTED,
+            TaskStatus.INTERRUPTED,
             error="User interrupted; run reconciliation required",
         )
         return EXIT_INTERRUPT
@@ -360,7 +368,7 @@ async def _chat(engine: TaskEngine, store: Store, workspace: Path | None, verbos
                     await run_task
             store.set_status(
                 current_task,
-                __import__("agent_center.domain", fromlist=["TaskStatus"]).TaskStatus.CANCELLED,
+                TaskStatus.CANCELLED,
                 error="Cancelled by user",
             )
             print("Task cancelled; start a new task for further requirements.")
@@ -369,9 +377,7 @@ async def _chat(engine: TaskEngine, store: Store, workspace: Path | None, verbos
             print("Pause requested; it takes effect after the current isolated CLI run finishes.")
         elif text == "/resume":
             if task and task["status"] == "paused" and run_task and run_task.done():
-                store.set_status(
-                    current_task, __import__("agent_center.domain", fromlist=["TaskStatus"]).TaskStatus.PLANNING
-                )
+                store.set_status(current_task, TaskStatus.PLANNING)
                 pause = asyncio.Event()
                 run_task = asyncio.create_task(
                     engine.run_task(current_task, progress=progress, cancel_event=cancel, pause_event=pause)
@@ -458,7 +464,7 @@ def main() -> None:
                 raise SystemExit(EXIT_BLOCKED)
             store.set_status(
                 args.task_id,
-                __import__("agent_center.domain", fromlist=["TaskStatus"]).TaskStatus.CANCELLED,
+                TaskStatus.CANCELLED,
                 error="Explicit user cancellation",
             )
             print(f"Task {args.task_id} marked cancelled; prior Runs and possible side effects remain in history.")
@@ -556,6 +562,54 @@ def main() -> None:
                 store.reconcile_task_runs(args.task_id, user_confirmed=True)
                 runs = store.runs(args.task_id)
             task = store.task(args.task_id)
+            pending_approval = store.pending_approval(args.task_id)
+            if pending_approval is not None:
+                approval_id, _pending_action = pending_approval
+                approval_row = store._connection.execute(
+                    "SELECT status FROM approvals WHERE approval_id=? AND task_id=?",
+                    (approval_id, args.task_id),
+                ).fetchone()
+                if approval_row is None or approval_row[0] not in {"approved", "denied", "expired"}:
+                    print("No matching approval decision has been recorded.", file=sys.stderr)
+                    raise SystemExit(EXIT_INPUT)
+                if approval_row[0] != "approved":
+                    store.clear_pending_approval(args.task_id, approval_id)
+                    print(f"Approval was {approval_row[0]}; the task remains paused without a permission grant.")
+                    raise SystemExit(EXIT_BLOCKED)
+                task = store.task(args.task_id)
+                if task is None:
+                    raise SystemExit(EXIT_CONFIG)
+                current_snapshot = engine._config_snapshot()
+                if not engine.approvals or engine.approvals.config_digest(
+                    current_snapshot
+                ) != engine.approvals.config_digest(json.loads(task["config_snapshot"])):
+                    store.expire_approvals_for_task(args.task_id, "task_config_changed")
+                    store.clear_pending_approval(args.task_id, approval_id)
+                    store.set_status(args.task_id, TaskStatus.BLOCKED, error="Approval configuration changed")
+                    print("Approval configuration snapshot changed; request expired.", file=sys.stderr)
+                    raise SystemExit(EXIT_BLOCKED)
+                approval_version = store._connection.execute(
+                    "SELECT requirements_version FROM approvals WHERE approval_id=?", (approval_id,)
+                ).fetchone()
+                if approval_version is None or int(task["requirements_version"]) != int(approval_version[0]):
+                    store.expire_approvals_for_task(args.task_id, "requirements_changed")
+                    store.clear_pending_approval(args.task_id, approval_id)
+                    store.set_status(args.task_id, TaskStatus.BLOCKED, error="Approval requirements changed")
+                    print("Approval requirements version changed; request expired.", file=sys.stderr)
+                    raise SystemExit(EXIT_BLOCKED)
+                store.expire_approvals_for_task(args.task_id, "backend_grant_unavailable")
+                store.clear_pending_approval(args.task_id, approval_id)
+                store.set_status(
+                    args.task_id,
+                    TaskStatus.BLOCKED,
+                    error="The configured backend cannot enforce the approved narrow scope",
+                )
+                # Approval is revalidated and logged; adapters still cannot apply a narrower grant.
+                print(
+                    "Approval decision recorded, but backend authorization remains unavailable; "
+                    "no privileged action is replayed."
+                )
+                raise SystemExit(EXIT_BLOCKED)
             if any(run["status"] == "unknown" for run in runs):
                 print(
                     "An unknown Run remains non-replayable even after operator reconciliation. "
@@ -613,9 +667,7 @@ def main() -> None:
             if task and task["status"] == "blocked":
                 print("Blocked task requires fixing its stated blocker before resume.", file=sys.stderr)
                 raise SystemExit(EXIT_BLOCKED)
-            store.set_status(
-                args.task_id, __import__("agent_center.domain", fromlist=["TaskStatus"]).TaskStatus.PLANNING
-            )
+            store.set_status(args.task_id, TaskStatus.PLANNING)
 
             async def progress(event: dict[str, Any]) -> None:
                 print(json.dumps(event, ensure_ascii=False), flush=True)

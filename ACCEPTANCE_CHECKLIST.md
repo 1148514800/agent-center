@@ -1,8 +1,10 @@
 # Agent 中控台 v0.1 验收清单
 
-**文档日期：2026-11-15。配套规范：`AGENT_CENTER_PROJECT_PLAN.md`。**
+**文档日期：2026-11-16。配套规范：`AGENT_CENTER_PROJECT_PLAN.md`。**
 
 本文件是待执行的验收规范，不是已经执行的测试报告。开发 Agent 应复制为 `docs/ACCEPTANCE_REPORT.md`，填写实际结果和证据，不直接把下面的待测项改成未经验证的 PASS。
+
+本轮架构约束：Python + SQLite；不强制容器，不自建 OS 沙箱。项目命令与测试全部由 Agent 原生执行环境执行，ProcessRunner 只管理 Agent CLI。能力状态使用 SUPPORTED / UNSUPPORTED / UNVERIFIED；验证状态使用 PASSED / FAILED / UNVERIFIED，与下方验收用例状态分开。
 
 ## 1. 报告规则
 
@@ -95,6 +97,8 @@ DeepSeek Harness 版本 / executable 路径 / 安装来源：
 | S14 | 配置与扩展信任 | 不根据项目文件启用中控插件/提权；原 CLI 扩展影响有记录 | U/I |
 | S15 | 重要删除/外传任务 | 未具备相应保护时阻塞敏感任务，不能靠危险字符串黑名单声称安全 | U/I |
 
+S02 必须同时在普通外部目录和系统临时目录放置非敏感哨兵，报告原生允许写入的例外；不能把临时目录内的工作区外写入成功忽略。
+
 S12 不要求对未知秘密进行实际探测，只验证报告的真实性和策略是否尊重未知边界。若产品声称“敏感读取/网络已隔离”，则必须追加相应真实执行证据，否则该声称不能通过。
 
 ## 6. 预算、故障与进程
@@ -144,6 +148,13 @@ S12 不要求对未知秘密进行实际探测，只验证报告的真实性和�
 | V07 | 验收标准被削弱 | 修改测试不自动等于修复正确；标准修改可追踪 | U/I |
 | V08 | 两 Agent 冲突 | 按可验证证据处理，不依赖多数投票 | U |
 | V09 | 证据来源 | Agent 可写报告仅算自述；中控采集事件保留来源和完整性 | U/I |
+| V11 | 固定 Plan 命令 | 只从当前 Plan 取 argv；固定 `/usr/bin/env PYTEST_ADDOPTS= PYTEST_PLUGINS= PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -B -m pytest -p no:cacheprovider -c /dev/null -o addopts= -q` 加明确文件；拒绝 Shell 追加/路径逃逸 | U/I |
+| V12 | 独立验证 Run | 不复用开发 Run；原生只读 CLI 执行，计入同一预算 | I+L |
+| V13 | 命令证据字段 | 精确命令、实际 cwd、命令 exit/status/output、CLI 退出码/终结均核验；缺字段 UNVERIFIED | U/I+L |
+| V14 | 证据完整绑定 | task/版本/criterion/Run/Plan 哈希/工作区/安装身份均绑定；更新后失效 | U/I |
+| V15 | 原生能力矩阵 | 两 Agent 分别记录九项三态能力；旧布尔标志不能放行；版本/权限变更失效 | U/I+L |
+| V16 | 不扩大验证权限 | 只读拒绝所需写操作后阻塞；不自动切 workspace-write 或换更松 Agent | U/I+L |
+| V17 | 无宿主项目执行 | 恶意测试哨兵不会由中控直接执行；合成 CLI 只产生事件，不能误计 L/E | I |
 | V10 | 真端到端闭环 | 真实统筹 → 真实 Agent → 验证 → 必要修复 → 当前版本最终报告 | E |
 
 ## 9. 推荐真实演示场景

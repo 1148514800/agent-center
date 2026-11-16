@@ -1,0 +1,43 @@
+[
+  {
+    "agent": "codex",
+    "returncode": -15,
+    "timed_out": true,
+    "completed": false,
+    "error": "timeout",
+    "event_kinds": [
+      "thread.started",
+      "item.completed",
+      "turn.started",
+      "error",
+      "error",
+      "error",
+      "error",
+      "item.completed",
+      "error",
+      "error",
+      "error",
+      "error",
+      "error"
+    ],
+    "commands": 0,
+    "credentials": "empty generated HOME and native credential home; no API keys inherited"
+  },
+  {
+    "agent": "deepseek",
+    "returncode": 1,
+    "timed_out": false,
+    "completed": false,
+    "error": "terminal_reason:error",
+    "event_kinds": [
+      "session",
+      "status",
+      "status",
+      "status",
+      "status",
+      "final"
+    ],
+    "commands": 0,
+    "credentials": "empty generated HOME and native credential home; no API keys inherited"
+  }
+]

@@ -1,3 +1,5 @@
+> 2026-11-16 架构修订：执行与验证以 `docs/ARCHITECTURE.md`、`docs/SECURITY_BOUNDARIES.md` 为准。Agent Center 仅管理 Agent CLI、状态、预算、审批和证据；项目代码及测试由 Agent 原生沙箱执行。不强制 Docker/OrbStack/Podman，不自建 OS 沙箱，不使用宿主测试后端。原生能力不足时保持 UNVERIFIED/BLOCKED。
+
 # Agent 中控台项目规划书
 
 **文档版本：1.0 · 编制日期：2026-11-15 · 产品目标版本：v0.1**

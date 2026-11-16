@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agent_center.domain import DirectAnswer, TaskStatus
-from agent_center.engine import TaskEngine
+from agent_center.adapters.base import AgentRunResult, LaunchSpec
+from agent_center.config import AppConfiguration
+from agent_center.domain import Criterion, Delegate, DirectAnswer, PlanStep, TaskStatus
+from agent_center.engine import EngineBlocked, TaskEngine
+from agent_center.runtime.process import ProcessResult
 from agent_center.storage.database import Store
 
 
@@ -22,7 +26,55 @@ class FakeModel:
         return "read only"
 
 
-def test_direct_answer_completes_without_agent_calls(config: Any, store: Store, tmp_path: Path) -> None:
+class PreflightAdapter:
+    def __init__(self, *, fail: bool):
+        self.fail = fail
+        self.calls = 0
+
+    def build_launch(self, request: Any) -> LaunchSpec:
+        self.calls += 1
+        if self.fail:
+            raise RuntimeError("synthetic preflight failure")
+        return LaunchSpec("/bin/true", (), {"PATH": "/usr/bin:/bin"}, b"", "synthetic")
+
+    def parse(self, request: Any, process: ProcessResult) -> AgentRunResult:
+        return AgentRunResult(process, (), True, None, "synthetic output")
+
+
+class PreflightRunner:
+    def __init__(self):
+        self.calls = 0
+
+    async def run(self, *args: Any, **kwargs: Any) -> ProcessResult:
+        self.calls += 1
+        out = kwargs["stdout_path"]
+        err = kwargs["stderr_path"]
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text("", encoding="utf-8")
+        err.write_text("", encoding="utf-8")
+        callback = kwargs.get("on_started")
+        if callback:
+            callback(99999999)
+        return ProcessResult(0, 0, 0, False, False, False)
+
+
+def test_active_deadline_uses_persisted_running_clock(config: AppConfiguration, store: Store, tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    task_id, _ = TaskEngine(config, store, model_client=FakeModel([])).create_task("What is SQLite?", workspace)
+    store.start_active_period(task_id)
+    with store.transaction() as conn:
+        conn.execute("UPDATE tasks SET active_started_at=? WHERE task_id=?", (time.time() - 100, task_id))
+    config = config.model_copy(update={"limits": config.limits.model_copy(update={"max_active_seconds": 1})})
+    engine = TaskEngine(config, store, model_client=FakeModel([]))
+    result = asyncio.run(engine.run_task(task_id))
+    assert result.startswith("blocked:")
+    assert "active-time budget" in result
+    assert store.task(task_id)["status"] == TaskStatus.BLOCKED
+    assert store.task(task_id)["supervisor_calls"] == 0
+
+
+def test_direct_answer_completes_without_agent_calls(config: AppConfiguration, store: Store, tmp_path: Path) -> None:
     model = FakeModel([DirectAnswer(action="answer", reason_summary="Simple question", answer="42")])
     engine = TaskEngine(config, store, model_client=model)
     workspace = tmp_path / "workspace"
@@ -34,10 +86,9 @@ def test_direct_answer_completes_without_agent_calls(config: Any, store: Store, 
     assert task["agent_calls"] == 0
 
 
-def test_external_publication_is_blocked_before_process_launch(config: Any, store: Store, tmp_path: Path) -> None:
-    from agent_center.domain import Criterion, Delegate, PlanStep
-    from agent_center.engine import EngineBlocked
-
+def test_external_publication_is_blocked_before_process_launch(
+    config: AppConfiguration, store: Store, tmp_path: Path
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     task_id, _ = TaskEngine(config, store, model_client=FakeModel([])).create_task("push the result", workspace)
@@ -47,7 +98,7 @@ def test_external_publication_is_blocked_before_process_launch(config: Any, stor
         acceptance_criteria=[
             Criterion(
                 id="publish-proof",
-                description="not supported",
+                description="unsupported",
                 verification_argv=["python", "-m", "pytest", "-q", "tests/test_publish.py"],
             )
         ],
@@ -56,42 +107,7 @@ def test_external_publication_is_blocked_before_process_launch(config: Any, stor
     engine = TaskEngine(config, store, model_client=FakeModel([]))
     action = Delegate(
         action="delegate",
-        reason_summary="test blocked publication",
-        agent_id="codex",
-        step_id="publish",
-        objective=step.objective,
-        acceptance_criteria=step.acceptance_criteria,
-    )
-    with pytest.raises(EngineBlocked, match="External"):
-        asyncio.run(engine._delegate(task_id, action, 1, "context"))
-    assert store.runs(task_id) == []
-
-
-def test_publication_is_blocked_before_process_launch(config: Any, store: Store, tmp_path: Path) -> None:
-    from agent_center.domain import Criterion, Delegate, PlanStep
-    from agent_center.engine import EngineBlocked
-
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    task_id, _ = TaskEngine(config, store, model_client=FakeModel([])).create_task(
-        "Push the deliverable to a remote registry", workspace
-    )
-    step = PlanStep(
-        id="publish",
-        objective="Push the deliverable to a remote registry",
-        acceptance_criteria=[
-            Criterion(
-                id="public-check",
-                description="public site is updated",
-                verification_argv=["python", "-m", "pytest", "-q", "tests/test_public.py"],
-            )
-        ],
-    )
-    store.update_plan(task_id, [step.model_dump(mode="json")], 1)
-    engine = TaskEngine(config, store, model_client=FakeModel([]))
-    action = Delegate(
-        action="delegate",
-        reason_summary="test policy gate",
+        reason_summary="policy gate",
         agent_id="codex",
         step_id=step.id,
         objective=step.objective,
@@ -102,8 +118,85 @@ def test_publication_is_blocked_before_process_launch(config: Any, store: Store,
     assert store.runs(task_id) == []
 
 
-def test_unavailable_execution_is_blocked_before_process_launch(config: Any, store: Store, tmp_path: Path) -> None:
-    # No credential, CLI, or provider request is needed to enforce the execution gate.
+def test_preflight_failure_routes_to_other_configured_agent_once(
+    verified_config: AppConfiguration, store: Store, tmp_path: Path
+) -> None:
+    from agent_center.capabilities import installation_identity
+
+    config = verified_config
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fake_codex = tmp_path / "fake-codex"
+    fake_codex.write_text("#!/bin/sh\necho synthetic\n", encoding="utf-8")
+    fake_codex.chmod(0o700)
+    config = config.model_copy(
+        update={
+            "agents": {
+                "codex": config.agents["codex"].model_copy(
+                    update={"executable": str(fake_codex), "allow_execution": True, "capability_status": "supported"}
+                ),
+                "deepseek": config.agents["deepseek"].model_copy(
+                    update={"allow_execution": True, "capability_status": "supported"}
+                ),
+            },
+            "limits": config.limits.model_copy(update={"max_step_retries": 1}),
+        }
+    )
+    agent = config.agents["codex"]
+    agent = agent.model_copy(
+        update={
+            "capabilities": agent.capabilities.model_copy(
+                update={"installation_identity": installation_identity(agent, config.profiles[agent.default_profile])}
+            )
+        }
+    )
+    config = config.model_copy(update={"agents": {**config.agents, "codex": agent}})
+    task_id, _ = TaskEngine(config, store, model_client=FakeModel([])).create_task(
+        "Implement a synthetic feature", workspace
+    )
+    criterion = Criterion(
+        id="c1", description="test", verification_argv=["python", "-m", "pytest", "-q", "tests/test_feature.py"]
+    )
+    step = PlanStep(id="s1", objective="implement feature", acceptance_criteria=[criterion])
+    store.update_plan(task_id, [step.model_dump(mode="json")], 1)
+    store.set_status(task_id, TaskStatus.PLANNING)
+    model = FakeModel(
+        [
+            Delegate(
+                action="delegate",
+                reason_summary="first route",
+                agent_id="codex",
+                step_id="s1",
+                objective=step.objective,
+                acceptance_criteria=step.acceptance_criteria,
+            ),
+            Delegate(
+                action="delegate",
+                reason_summary="alternate route",
+                agent_id="deepseek",
+                step_id="s1",
+                objective=step.objective,
+                acceptance_criteria=step.acceptance_criteria,
+            ),
+        ]
+    )
+    runner = PreflightRunner()
+    engine = TaskEngine(config, store, model_client=model, process_runner=runner)
+    engine.adapters["codex_exec"] = PreflightAdapter(fail=True)
+    engine.adapters["deepseek_headless"] = PreflightAdapter(fail=True)
+    result = asyncio.run(engine.run_task(task_id))
+    assert result.startswith("blocked:")
+    assert store.runs(task_id) == []
+    assert runner.calls == 0
+    assert engine.adapters["codex_exec"].calls == 1
+    assert engine.adapters["deepseek_headless"].calls == 1
+    events = store.events(task_id)
+    assert sum(event["type"] == "agent_call_reserved" for event in events) <= 2
+
+
+def test_unavailable_execution_is_blocked_before_process_launch(
+    config: AppConfiguration, store: Store, tmp_path: Path
+) -> None:
     config = config.model_copy(
         update={
             "agents": {
@@ -116,7 +209,7 @@ def test_unavailable_execution_is_blocked_before_process_launch(config: Any, sto
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     task_id, _ = engine.create_task("test", workspace)
-    from agent_center.domain import Criterion, Delegate, PlanStep
+    from agent_center.domain import Criterion
     from agent_center.engine import EngineBlocked
 
     step = PlanStep(
@@ -124,9 +217,7 @@ def test_unavailable_execution_is_blocked_before_process_launch(config: Any, sto
         objective="do nothing",
         acceptance_criteria=[
             Criterion(
-                id="c1",
-                description="safe",
-                verification_argv=["python", "-m", "pytest", "-q", "tests/test_safe.py"],
+                id="c1", description="safe", verification_argv=["python", "-m", "pytest", "-q", "tests/test_safe.py"]
             )
         ],
     )

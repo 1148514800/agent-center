@@ -1,0 +1,110 @@
+[
+  {
+    "profile": ":read-only",
+    "probe": "workspace_read",
+    "returncode": 0,
+    "stdout": "/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/workspace",
+    "stderr": ""
+  },
+  {
+    "profile": ":read-only",
+    "probe": "workspace_write",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from pathlib import Path; Path('probe').write_text('ok')\n                              ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 809, in write_text\n    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 771, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted: 'probe'"
+  },
+  {
+    "profile": ":read-only",
+    "probe": "outside_write",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from pathlib import Path; Path('/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel').write_text('changed')\n                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 809, in write_text\n    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 771, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted: '/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel'"
+  },
+  {
+    "profile": ":read-only",
+    "probe": "outside_read",
+    "returncode": 0,
+    "stdout": "NONSECRET-SENTINEL",
+    "stderr": ""
+  },
+  {
+    "profile": ":read-only",
+    "probe": "loopback_network",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',59796)); print('connected')\n                                                       ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted"
+  },
+  {
+    "profile": ":workspace",
+    "probe": "workspace_read",
+    "returncode": 0,
+    "stdout": "/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/workspace",
+    "stderr": ""
+  },
+  {
+    "profile": ":workspace",
+    "probe": "workspace_write",
+    "returncode": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  {
+    "profile": ":workspace",
+    "probe": "outside_write",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from pathlib import Path; Path('/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel').write_text('changed')\n                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 809, in write_text\n    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 771, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted: '/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel'"
+  },
+  {
+    "profile": ":workspace",
+    "probe": "outside_read",
+    "returncode": 0,
+    "stdout": "NONSECRET-SENTINEL",
+    "stderr": ""
+  },
+  {
+    "profile": ":workspace",
+    "probe": "loopback_network",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',59796)); print('connected')\n                                                       ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted"
+  },
+  {
+    "profile": "ac-restricted",
+    "probe": "workspace_read",
+    "returncode": 0,
+    "stdout": "/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/workspace",
+    "stderr": ""
+  },
+  {
+    "profile": "ac-restricted",
+    "probe": "workspace_write",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from pathlib import Path; Path('probe').write_text('ok')\n                              ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 809, in write_text\n    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 771, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted: 'probe'"
+  },
+  {
+    "profile": "ac-restricted",
+    "probe": "outside_write",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from pathlib import Path; Path('/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel').write_text('changed')\n                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 809, in write_text\n    with self.open(mode='w', encoding=encoding, errors=errors, newline=newline) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 771, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted: '/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel'"
+  },
+  {
+    "profile": "ac-restricted",
+    "probe": "outside_read",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    from pathlib import Path; print(Path('/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel').read_text())\n                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 787, in read_text\n    with self.open(mode='r', encoding=encoding, errors=errors, newline=newline) as f:\n         ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/godblack/.local/share/uv/python/cpython-3.14.10-macos-aarch64-none/lib/python3.14/pathlib/__init__.py\", line 771, in open\n    return io.open(self, mode, buffering, encoding, errors, newline)\n           ~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted: '/private/var/folders/md/n4b7xzwx1jz2c4j4wxftzlgw0000gn/T/agent-center-native-qno58ye4/sensitive-sentinel'"
+  },
+  {
+    "profile": "ac-restricted",
+    "probe": "loopback_network",
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n    import socket; s=socket.socket(); s.settimeout(1); s.connect(('127.0.0.1',59796)); print('connected')\n                                                       ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^\nPermissionError: [Errno 1] Operation not permitted"
+  },
+  {
+    "outside_sentinel_unchanged": true
+  }
+]

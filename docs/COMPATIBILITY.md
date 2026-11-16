@@ -1,37 +1,43 @@
-# Local compatibility probe — 2026-11-15 (Asia/Shanghai)
+# 本机原生 CLI 兼容性 — 2026-11-16
 
-This report distinguishes static CLI inspection, deterministic mocks, and real paid/task calls. Static probe commands were run on the current macOS host; no CLI task, API request, credential file read, or sentinel-write attempt was performed.
-
-## Host
-
-| Item | Observed | Result |
-|---|---|---|
-| OS / architecture | macOS 25.6, arm64 | v0.1 target family; runtime sandbox probes NOT_RUN |
-| Python | system 3.9.6; uv-managed 3.12.16 and 3.14.10 | selected runtime 3.14.10 |
-| SQLite | system 3.51.0; Python 3.14 sqlite3 3.53.1 | SQLite unit tests use bundled runtime |
-| uv | 0.13.6 (arm64 macOS) | lock generated for Python 3.14 |
+环境：macOS 26.6 / 25G72 arm64，Codex CLI 0.166.0，DeepSeek Harness 0.2.2-rc.3，开发 Python 3.14.10。探针只使用一次性目录和非敏感哨兵；未修改用户 Codex/DeepSeek 配置。模型任务没有成功执行。
 
 ## Codex
 
-- Executable: `/Users/godblack/.local/bin/codex`; release binary: `/Users/godblack/.codex/packages/standalone/releases/0.166.0-aarch64-apple-darwin/bin/codex`.
-- `codex --version` → `codex-cli 0.166.0`, exit 0. `codex exec --help`, exit 0.
-- Help confirms JSONL `exec`, stdin prompt, `--sandbox read-only|workspace-write|danger-full-access`, `--cd`, `--model`, `-c`, `--ephemeral`, `--ignore-user-config`, and the dangerous bypass/auto-approve options. The adapter does not emit bypass or auto-approve flags.
-- `OPENAI_API_KEY` was unset at the time of the static probe. Stored CLI auth was not inspected or tested.
-- JSON event shape, requested model actually used, permission enforcement, sensitive reads, network, extensions, external-write denial, failure/cancel behavior and process tree cleanup remain unverified.
-- Static launch mapping supported; actual execution status UNVERIFIED and disabled in the example config.
+`codex --version`、`codex exec --help`、`codex --help` 和 `codex sandbox --help` 已检查。当前命令映射：
+
+```text
+codex --ask-for-approval never exec --json --ephemeral --ignore-user-config
+  --ignore-rules -c sandbox_workspace_write.network_access=false
+  --sandbox read-only|workspace-write --cd WORKSPACE --model MODEL
+```
+
+`--ask-for-approval` 位于根命令；`never` 拒绝升级请求，不绕过沙箱。适配器不发出 yolo、full-access、自动审查放行或沙箱绕过选项。`CODEX_HOME` 可用于已有认证，忽略用户配置并不意味着忽略所有系统托管配置。
+
+真实 `codex sandbox -P :read-only|:workspace` 探针已通过原生 Seatbelt 运行可信命令。只读拒绝工作区写入；workspace 允许工作区写入；两者拒绝探针中的越界写入及 loopback TCP 连接。两者均能读取工作区外的非敏感哨兵：内置模式不能宣称敏感读取隔离。网络结果只覆盖本机 TCP 探针，不泛化为所有外传途径。
+
+Permission Profiles 研究：本版本支持 `-P` 原生 sandbox 命令；以单次 `-c` 传入命名 profile 的 filesystem/network 表可拒绝根目录读取，只允许 workspace、minimal runtime 与明确的 Python runtime 读取，并禁用网络。实测读工作区成功、读外部哨兵被拒绝，无需修改 `~/.codex/config.toml`。这目前是探针配置，未接入生产适配器，不能为其默认 legacy sandbox 配置背书。生产接入前仍需验证模型文件工具、实际命令事件、所有 runtime 路径及配置优先级。
+
+[官方 Permission Profiles 文档](https://learn.chatgpt.com/docs/permissions) 指出，旧 `--sandbox` 设置会优先于 `default_permissions`，两种配置不能混用。将来的适配器必须分别构造并重新验证，不能叠加后假设细粒度配置已生效。
+
+真实 `exec --json` 空认证探针得到 401 重试事件，15 秒超时后进程退出 -15；未出现命令事件或正常终结。命令事件的实际 cwd 字段、exit_code/status/aggregated_output 及正常 turn.completed/turn.failed 仍未实测。解析器不会从 `--cd` 或最终文字推断命令 cwd；当前版本若缺该字段，验证只能 UNVERIFIED。
 
 ## DeepSeek Harness
 
-- No `dsh` command on shell PATH. Installed Desktop package is `@deepseek-ai/dsh` `0.2.2-rc.3` inside `/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh`.
-- Verified launcher: `/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness`; `DSH_NODE_EXECUTABLE` plus `DSH_INSTALL_DIR/lib/bin.js` works with `ELECTRON_RUN_AS_NODE=1`.
-- Root CLI help, `--profile headless --help`, and `--dump-default-config` exited 0 without task/API work. Headless flags confirmed: `--json`, `--permission-mode`, `--approval-policy ask|never`, and `--add-dir`. No direct model/reasoning CLI option; root `--patch` accepts per-invocation overlays.
-- Shipped headless documentation states that managed GUI credential store/account consumers are disabled; API key routes use launch environment, invocation cwd `.env`, then DSH_HOME `.env`. No environment value, `.env`, profile, or credential was read. The current machine's headless auth is unverified.
-- Shipped docs describe a macOS Seatbelt write boundary; this does not verify sensitive-read or network isolation. `never` refuses calls needing approval; there is no live approval-response channel.
-- Event JSON, overlay precedence/model confirmation, actual auth, sandbox enforcement and process-group cancellation were not task-tested.
-- Static launch mapping supported; actual execution status UNVERIFIED and disabled in the example config.
+通过 Electron launcher 调用 ASAR 内 `lib/bin.js`；普通 Python `Path.is_file()` 不能检查 ASAR 内部文件，因此适配器允许已存在的 ASAR 包路径，最终启动仍由 Electron 验证。缺失入口不会降级到其他执行器。
 
-## Test-layer result
+已检查 `--profile headless --help`：支持 `--permission-mode read-only|workspace-write`、`--approval-policy never`、`--json`、`--add-dir` 和 `--session-id`。后者用于采用已有持久化会话，未知 ID 报错；独立 Run 不传入旧 session ID，不传额外写目录。
 
-- `U` (unit) and `I` (synthetic process) results are recorded in `docs/ACCEPTANCE_REPORT.md`; they are offline only.
-- `L` (real API/Codex/DeepSeek CLI) and `E` (true end-to-end) are NOT_RUN. This session has not sent paid or task-execution requests.
-- `doctor` is a static probe by default. `doctor --live` is intended to send one short, tool-free supervisor request; do not run it without an agreed provider, model, credentials and budget.
+每次调用写入私有模型路由 overlay，使用独立 `DSH_HOME`，不继承 GUI token 或统筹 API key。安装文档说明 Headless 不消费 GUI 托管凭证，但还可能读取 cwd/DSH_HOME 的 `.env`；显式环境白名单不能单独证明完整认证隔离。空 HOME/DSH_HOME 的真实 CLI 探针返回 `MISSING_CREDENTIAL`、`final.reason.kind=error`、进程退出 1。真实已认证模型路由、API key 与 GUI 的全面隔离尚未验证。
+
+直接调用已安装 `LocalSandboxProvider.confine`（未经修改的原生库，不自建 Seatbelt）的探针显示：read-only 拒绝工作区及外部写入；workspace-write 允许工作区写入、拒绝普通 home 下的外部写入，但允许系统临时目录内的外部写入。两种模式均允许外部读取与 loopback TCP 连接。库返回的 `enforcement=full` 指文件效果沙箱，不是网络/敏感读取隔离。该探针不等同 Headless 完整执行链已验证。
+
+安装源码确认 Headless `tool_call` 有 callId/tool/input，`tool_result` 有 callId/status/result。`result` 是 Bash 输出渲染后的文本，未传递执行器内部 canonical `cwd/exitCode/timedOut/aborted` DTO。解析器关联 call/result，拒绝重复或悬空 call；不把 completed 当命令退出零，也不从可伪造输出标记提取成功。当前原生协议的结构化命令退出证明为 UNSUPPORTED，验证保持 UNVERIFIED。
+
+Headless 无实时审批回应：需要审批时拒绝、保存现场、返回中控；审批记录不能恢复旧进程。
+
+## 证据与仍未验证项目
+
+[Codex sandbox 探针](evidence/native-sandbox-2026-11-16.json)、[DeepSeek 原生库探针](evidence/deepseek-native-sandbox-2026-11-16.json)、[DeepSeek 临时目录例外](evidence/deepseek-temp-boundary-2026-11-16.json)、[真实 CLI 失败路径](evidence/cli-failure-probes-2026-11-16.json)。可复现脚本位于 `tests/live/`，默认 pytest 不运行这些脚本。
+
+真实成功命令事件、完整原生取消/后代清理、真实模型路由、统筹端到端均未通过。两个 Agent 的能力结论独立；原生探针结果不会自动写入或启用产品配置。

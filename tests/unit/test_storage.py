@@ -1,9 +1,74 @@
 from __future__ import annotations
 
 from pathlib import Path
+from time import sleep
 
 from agent_center.domain import TaskStatus
 from agent_center.storage.database import Store
+
+
+def test_stop_resume_clock_preserves_elapsed_time_across_restart(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = Store(data_dir)
+    task_id = store.create_task("What is a task?", workspace, {})
+    store.start_active_period(task_id)
+    sleep(0.02)
+    before_restart = store.active_seconds_now(task_id)
+    assert before_restart > 0
+    store.close()
+
+    restored = Store(data_dir)
+    try:
+        assert restored.active_seconds_now(task_id) >= before_restart
+        settled = restored.settle_active_period(task_id)
+        assert settled >= before_restart
+        assert restored.task(task_id)["active_started_at"] is None
+    finally:
+        restored.close()
+
+
+def test_stale_active_period_is_charged_on_recovery(tmp_path: Path) -> None:
+    import time
+
+    data_dir = tmp_path / "data"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    store = Store(data_dir)
+    task_id = store.create_task("What is a task?", workspace, {})
+    store.start_active_period(task_id)
+    with store.transaction() as conn:
+        conn.execute("UPDATE tasks SET active_started_at=? WHERE task_id=?", (time.time() - 60, task_id))
+    assert store.recover_stale_active_period(task_id) >= 60
+    assert store.task(task_id)["active_started_at"] is None
+    store.close()
+
+
+def test_plan_rejects_criterion_ids_reused_across_steps(store: Store, tmp_path: Path) -> None:
+    from agent_center.domain import Criterion, PlanStep
+
+    task_id = store.create_task("Implement a feature", tmp_path, {})
+    criterion_a = Criterion(
+        id="same-id",
+        description="first check",
+        verification_argv=["python", "-m", "pytest", "-q", "tests/test_first.py"],
+    )
+    criterion_b = Criterion(
+        id="same-id",
+        description="second check",
+        verification_argv=["python", "-m", "pytest", "-q", "tests/test_second.py"],
+    )
+    plan = [
+        PlanStep(id="step-a", objective="first", acceptance_criteria=[criterion_a]),
+        PlanStep(id="step-b", objective="second", acceptance_criteria=[criterion_b]),
+    ]
+    try:
+        store.update_plan(task_id, [step.model_dump(mode="json") for step in plan], 1)
+    except ValueError as exc:
+        assert "globally unique" in str(exc)
+    else:
+        raise AssertionError("duplicate criterion IDs must be rejected")
 
 
 def test_event_and_state_commit_atomically(store: Store, tmp_path: Path) -> None:
@@ -72,9 +137,9 @@ def test_only_complete_current_evidence_can_finish(store: Store, tmp_path: Path)
 
 
 def test_ambiguous_run_becomes_unknown_not_replayed(store: Store, tmp_path: Path) -> None:
-    task_id = store.create_task("implement a synthetic fixture", tmp_path, {})
     from agent_center.domain import Criterion, PlanStep
 
+    task_id = store.create_task("implement a synthetic fixture", tmp_path, {})
     step = PlanStep(
         id="s1",
         objective="synthetic",

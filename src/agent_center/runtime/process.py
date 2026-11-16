@@ -22,6 +22,8 @@ class ProcessResult:
 
 
 class ProcessRunner:
+    """Manage Agent CLI lifetimes and logs. Callers must never pass project commands here."""
+
     def __init__(self, *, termination_grace_seconds: int = 5, max_log_bytes: int = 52_428_800):
         self.grace = termination_grace_seconds
         self.max_log_bytes = max_log_bytes
