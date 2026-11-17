@@ -66,6 +66,12 @@ class TaskEngine:
         }
 
     def create_task(self, goal: str, workspace: Path | None = None) -> tuple[str, Path]:
+        active = self.store.active_task()
+        if active:
+            raise RuntimeError(f"单任务模式：请打开当前任务 {active['task_id']} 追加需求，或取消后新建任务")
+        unresolved = self.store.unresolved_runs()
+        if unresolved:
+            raise RuntimeError(f"请先打开任务 {unresolved[0]['task_id']}，对账 Run {unresolved[0]['run_id']}")
         if workspace is None:
             root = Path(self.config.app.default_workspace_root).expanduser().resolve()
             data = Path(self.config.app.data_dir).expanduser().resolve()
@@ -75,19 +81,6 @@ class TaskEngine:
             workspace.mkdir(mode=0o700)
         else:
             workspace = self._validate_workspace(workspace)
-        active = self.store._connection.execute(
-            "SELECT task_id FROM tasks WHERE status IN ('created','planning','running','verifying',"
-            "'waiting_approval','paused','blocked','interrupted') LIMIT 1"
-        ).fetchone()
-        if active:
-            raise RuntimeError(f"Single-task mode: resolve active task {active[0]} before starting another")
-        unresolved = self.store._connection.execute(
-            "SELECT task_id FROM runs WHERE status IN ('prepared','starting','running','unknown') LIMIT 1"
-        ).fetchone()
-        if unresolved:
-            raise RuntimeError(
-                f"Cannot create a task while run {unresolved[0]} is unresolved; reconcile its side effects"
-            )
         snapshot = self._config_snapshot()
         task_id = self.store.create_task(goal, workspace, snapshot)
         return task_id, workspace

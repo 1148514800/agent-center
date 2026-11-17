@@ -162,3 +162,26 @@ def test_deepseek_protocol_fail_closed(agent_request: AgentRequest, fault: str) 
         )
     (agent_request.log_dir / "stdout.log").write_text("".join(json.dumps(e) + "\n" for e in events))
     assert not DeepSeekHeadlessAdapter().parse(agent_request, ProcessResult(0, 1, 0, False, False, False)).completed
+
+
+def test_codex_custom_connection_uses_per_call_provider(
+    agent_request: AgentRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("CODEX_API_KEY", "synthetic-key")
+    profile = agent_request.profile.model_copy(
+        update={"base_url": "https://gateway.example/v1", "api_key_env": "CODEX_API_KEY"}
+    )
+    launch = CodexExecAdapter().build_launch(replace(agent_request, profile=profile))
+    assert 'model_provider="agent_center"' in launch.argv
+    assert any('base_url="https://gateway.example/v1"' in arg for arg in launch.argv)
+    assert launch.environment["CODEX_API_KEY"] == "synthetic-key"
+    assert all("synthetic-key" not in arg for arg in launch.argv)
+
+
+def test_codex_subscription_default_needs_no_api_or_model(agent_request: AgentRequest) -> None:
+    profile = agent_request.profile.model_copy(update={"model": "", "base_url": "", "api_key_env": ""})
+    launch = CodexExecAdapter().build_launch(replace(agent_request, profile=profile))
+    assert "--model" not in launch.argv
+    assert not any("model_provider=" in arg for arg in launch.argv)
+    assert "OPENAI_API_KEY" not in launch.environment
+    assert "CODEX_API_KEY" not in launch.environment

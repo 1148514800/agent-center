@@ -807,6 +807,12 @@ class Store:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def active_task(self) -> dict[str, Any] | None:
+        row = self._connection.execute(
+            "SELECT * FROM tasks WHERE status NOT IN ('succeeded','failed','cancelled') ORDER BY rowid LIMIT 1"
+        ).fetchone()
+        return dict(row) if row else None
+
     def messages(self, task_id: str) -> list[dict[str, Any]]:
         return [
             dict(row)
@@ -906,14 +912,17 @@ class Store:
     def reconcile_task_runs(self, task_id: str, *, user_confirmed: bool) -> list[str]:
         if not user_confirmed:
             raise PermissionError("Explicit user reconciliation confirmation is required")
+        task = self.task(task_id)
+        if task is None:
+            raise ValueError("任务不存在")
         rows = self._connection.execute(
-            "SELECT run_id,status,pid,process_start_identity FROM runs WHERE task_id=? "
+            "SELECT * FROM runs WHERE task_id=? "
             "AND (status IN ('prepared','starting','running','unknown','cancelled','timed_out') "
             "OR (status='failed' AND event_complete=0))",
             (task_id,),
         ).fetchall()
         stamp = now()
-        run_ids = [row[0] for row in rows]
+        run_ids = [row["run_id"] for row in rows]
         with self.transaction() as conn:
             for row in rows:
                 conn.execute(
@@ -921,14 +930,14 @@ class Store:
                     (
                         stamp,
                         "User confirmed process/workspace reconciliation; no prior action replayed",
-                        row[0],
+                        row["run_id"],
                     ),
                 )
             conn.execute(
                 "UPDATE tasks SET status=?,last_error=?,plan_json='[]',criteria_json='[]',"
                 "state_version=state_version+1,updated_at=? WHERE task_id=?",
                 (
-                    TaskStatus.PLANNING,
+                    task["status"] if task["status"] in {"succeeded", "failed", "cancelled"} else TaskStatus.PLANNING,
                     "Prior effects reviewed; create a fresh plan before any new Run",
                     stamp,
                     task_id,
@@ -942,6 +951,8 @@ class Store:
                     "run_ids": run_ids,
                     "explicit_confirmation": True,
                     "plan_cleared": True,
+                    "prior_plan": json.loads(task["plan_json"]),
+                    "prior_runs": [dict(row) for row in rows],
                 },
             )
         return run_ids

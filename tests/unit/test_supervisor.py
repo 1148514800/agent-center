@@ -125,3 +125,23 @@ def test_model_api_rejects_multiple_tools(config: AppConfiguration, monkeypatch:
     model = ModelClient(config, transport=httpx.MockTransport(handler))
     with pytest.raises(ModelError, match="Multiple"):
         asyncio.run(model.decide(system="s", user="u", allow_execution=True))
+
+
+def test_supervisor_model_options_reach_transport(config: AppConfiguration, monkeypatch: pytest.MonkeyPatch) -> None:
+    _config(config, monkeypatch)
+    config = config.model_copy(update={"supervisor": config.supervisor.model_copy(update={
+        "model": "selected-model", "reasoning_effort": "high", "max_output_tokens": 2048,
+        "request_timeout_seconds": 30,
+    })})
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["model"] == "selected-model"
+        assert payload["reasoning_effort"] == "high"
+        assert payload["max_tokens"] == 2048
+        assert request.extensions["timeout"]["read"] == 30
+        return httpx.Response(200, json={"choices": [{"message": {"content": "synthetic"}}]})
+
+    asyncio.run(ModelClient(config, transport=httpx.MockTransport(handler)).decide(
+        system="system", user="question", allow_execution=True
+    ))

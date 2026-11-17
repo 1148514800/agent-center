@@ -56,6 +56,19 @@ def parser() -> argparse.ArgumentParser:
     web.add_argument("--port", type=int, default=8765)
     web.add_argument("--no-browser", action="store_true")
     sub.add_parser("agents", help="Show configured agent adapters and compatibility status")
+    agent = sub.add_parser("agent", help="Register installed agents without editing TOML")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    add = agent_sub.add_parser("add", help="Add a locally installed CLI agent")
+    add.add_argument("agent_id", choices=["codex", "deepseek"])
+    add.add_argument("--executable")
+    add.add_argument("--model")
+    add.add_argument("--reasoning-effort", default="")
+    add.add_argument("--base-url", default="")
+    add.add_argument("--api-key-env", default="")
+    add.add_argument("--provider", default="deepseek-official")
+    add.add_argument("--cli-install-dir")
+    add.add_argument("--permission-mode", choices=["read-only", "workspace-write"], default="read-only")
+    add.add_argument("--replace", action="store_true")
     run = sub.add_parser("run", help="Create one task and execute the coordinator")
     run.add_argument("goal")
     run.add_argument("--workspace", type=Path, help="Existing explicitly selected workspace")
@@ -410,7 +423,7 @@ def main() -> None:
     try:
         config = _load_configuration(args)
     except Exception as exc:
-        if args.command in {"doctor", "web"}:
+        if args.command in {"doctor", "web", "agent"} and not config_path.expanduser().exists():
             print(f"Configuration: NOT_CONFIGURED ({type(exc).__name__})")
             config = offline_default_configuration()
         elif args.command == "agents":
@@ -419,6 +432,85 @@ def main() -> None:
         else:
             print(f"Configuration error: {type(exc).__name__}: {redact_text(str(exc))}", file=sys.stderr)
             raise SystemExit(EXIT_CONFIG) from exc
+    if not config_path.expanduser().exists():
+        from agent_center.setup import apply_registrations
+
+        config = apply_registrations(config, config_path)
+    if args.command == "agent":
+        from agent_center.setup import discover_agents, ensure_configuration_editable, register_agent
+
+        found = next((a for a in discover_agents() if a["agent_id"] == args.agent_id), {})
+        executable = args.executable or found.get("executable", "")
+        model = args.model or ""
+        package = args.cli_install_dir or found.get("cli_install_dir", "")
+        if sys.stdin.isatty():
+            executable = input(f"CLI executable [{executable}]: ").strip() or executable
+            if not model:
+                from agent_center.models import discover_models
+
+                try:
+                    catalog = asyncio.run(
+                        discover_models(
+                            {
+                                "agent_id": args.agent_id,
+                                "executable": executable,
+                                "cli_install_dir": package,
+                                "base_url": args.base_url,
+                                "api_key_env": args.api_key_env,
+                            }
+                        )
+                    )["models"]
+                    for index, item in enumerate(catalog, 1):
+                        print(f"{index}. {item['name']} ({item['id']})")
+                    selection = input("Model number / ID (blank = CLI default): ").strip()
+                    selected = (
+                        catalog[int(selection) - 1]
+                        if selection.isdigit() and 1 <= int(selection) <= len(catalog)
+                        else None
+                    )
+                    model = selected["id"] if selected else selection
+                    if selected and selected.get("efforts") and not args.reasoning_effort:
+                        print("Reasoning choices: " + ", ".join(selected["efforts"]))
+                        effort = input("Reasoning effort (blank = model default): ").strip()
+                        if effort and effort not in selected["efforts"]:
+                            raise ValueError("Selected model does not support this reasoning effort")
+                        args.reasoning_effort = effort
+                except (OSError, ValueError, TimeoutError) as exc:
+                    print(f"Model discovery unavailable: {type(exc).__name__}")
+                    model = input("Model ID (Codex subscription: blank = default): ").strip()
+            if args.agent_id == "deepseek":
+                package = input(f"Harness package directory [{package}]: ").strip() or package
+        try:
+            data_dir = Path(args.data_dir or config.app.data_dir).expanduser()
+            with WorkspaceLock(data_dir / "runtime.lock"):
+                setup_store = Store(data_dir)
+                try:
+                    existing = config.agents.get(args.agent_id)
+                    adding = existing is None or "REPLACE_WITH" in config.profiles[existing.default_profile].model
+                    ensure_configuration_editable(setup_store, adding=adding)
+                    register_agent(
+                        config,
+                        config_path,
+                        {
+                            "agent_id": args.agent_id,
+                            "executable": executable,
+                            "model": model,
+                            "provider": args.provider if args.agent_id == "deepseek" else "",
+                            "cli_install_dir": package,
+                            "permission_mode": args.permission_mode,
+                            "base_url": args.base_url,
+                            "api_key_env": args.api_key_env,
+                            "reasoning_effort": args.reasoning_effort,
+                        },
+                        replace=args.replace,
+                    )
+                finally:
+                    setup_store.close()
+        except (ValueError, OSError, RuntimeError) as exc:
+            print(f"Registration failed: {exc}", file=sys.stderr)
+            raise SystemExit(EXIT_CONFIG) from exc
+        print(f"Registered {args.agent_id}. Execution remains disabled until native capabilities are verified.")
+        return
     if args.data_dir:
         config = config.model_copy(update={"app": config.app.model_copy(update={"data_dir": str(args.data_dir)})})
     if args.command == "doctor":
@@ -436,7 +528,7 @@ def main() -> None:
             from agent_center.web_server import serve
 
             try:
-                asyncio.run(serve(engine, store, args.port, open_browser=not args.no_browser))
+                asyncio.run(serve(engine, store, args.port, open_browser=not args.no_browser, config_path=config_path))
             except KeyboardInterrupt:
                 print("Web server stopped; task state preserved.")
             return

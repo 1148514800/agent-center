@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from pathlib import Path
@@ -44,9 +45,19 @@ class CodexExecAdapter:
             request.profile.permission_mode,
             "--cd",
             str(request.workspace),
-            "--model",
-            request.profile.model,
         ]
+        if request.profile.model:
+            argv.extend(["--model", request.profile.model])
+        if request.profile.base_url:
+            key_env = request.profile.api_key_env or "OPENAI_API_KEY"
+            provider = (
+                '{name="Agent Center",base_url='
+                + json.dumps(request.profile.base_url)
+                + ",env_key="
+                + json.dumps(key_env)
+                + ',wire_api="responses",requires_openai_auth=false}'
+            )
+            argv.extend(["-c", 'model_provider="agent_center"', "-c", "model_providers.agent_center=" + provider])
         if request.profile.reasoning_effort:
             argv.extend(["-c", f'model_reasoning_effort="{request.profile.reasoning_effort}"'])
         prompt = (
@@ -66,6 +77,10 @@ class CodexExecAdapter:
         for name in request.profile.credential_env:
             if name == "CODEX_HOME" and name in os.environ:
                 env[name] = os.environ[name]
+        if request.profile.base_url:
+            key_env = request.profile.api_key_env or "OPENAI_API_KEY"
+            if key_env in os.environ:
+                env[key_env] = os.environ[key_env]
         return LaunchSpec(str(executable_path), tuple(argv), env, prompt.encode(), "codex-jsonl-v1")
 
     def parse(self, request: AgentRequest, process: ProcessResult) -> AgentRunResult:

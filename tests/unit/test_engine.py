@@ -239,3 +239,13 @@ def test_unavailable_execution_is_blocked_before_process_launch(
             )
         )
     assert store.runs(task_id) == []
+
+
+def test_single_task_guard_does_not_create_orphan_workspaces(config: AppConfiguration, store: Store) -> None:
+    engine = TaskEngine(config, store)
+    task_id, workspace = engine.create_task("First")
+    before = set(workspace.parent.iterdir())
+    with pytest.raises(RuntimeError, match=task_id):
+        engine.create_task("Second")
+    assert set(workspace.parent.iterdir()) == before
+    assert len(store.list_tasks()) == 1

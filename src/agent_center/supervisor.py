@@ -157,6 +157,8 @@ class ModelClient:
         if allow_execution:
             body["tools"] = TOOL_DEFINITIONS
             body["tool_choice"] = "auto"
+        if self.config.supervisor.reasoning_effort:
+            body["reasoning_effort"] = self.config.supervisor.reasoning_effort
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         timeout = httpx.Timeout(self.config.supervisor.request_timeout_seconds)
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, transport=self.transport) as client:

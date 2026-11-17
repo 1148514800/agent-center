@@ -39,6 +39,30 @@ The server binds only to loopback and uses same-origin/Host checks plus a per-pr
 
 ![Browser workbench](docs/images/web-workbench.jpg)
 
+## Add an installed Agent
+
+Web: open **连接与能力 → 添加 Agent**, select Codex CLI or DeepSeek Harness, click **自动检测安装** (or browse for the executable), and enter the actual model ID. DeepSeek additionally requires a provider route and its package directory containing `lib/bin.js`; Electron ASAR paths can be entered directly. Saving updates the running web service immediately. Replacing an existing configured Agent requires the replacement checkbox.
+
+CLI interactive wizard (detects common installation paths):
+
+```sh
+uv run --locked agent-center agent add codex
+uv run --locked agent-center agent add deepseek
+```
+
+Noninteractive examples (replace model IDs with ones available in your CLI):
+
+```sh
+uv run --locked agent-center agent add codex --executable /absolute/path/to/codex --model YOUR_MODEL_ID
+uv run --locked agent-center agent add deepseek --executable "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness" --cli-install-dir "/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh/node_modules/@deepseek-ai/dsh" --provider deepseek-official --model YOUR_MODEL_ID
+```
+
+Use `--replace` to explicitly replace an existing Agent. The default permission is read-only; `--permission-mode workspace-write` records the requested native mode. This registers existing software, without downloading it or editing either native CLI config. The CLI uses credential environment variables; the web form optionally accepts a key for the current server process only, without persisting it. Registration resets capabilities to UNVERIFIED and execution stays disabled until native boundaries are verified.
+
+Registration settings are stored atomically with mode 0600 in `config.toml.agents.json` alongside the selected Agent Center TOML (default `~/.agent-center/config.toml.agents.json`). The original TOML is preserved. CLI and web both reload these settings, including when the base TOML has not yet been created; supervisor configuration is still needed for real tasks. Running tasks and unresolved Runs block connection edits. Idle tasks allow adding a new Agent; replacing an existing connection is allowed before any Run or approval exists. Otherwise open the blocking task, stop if necessary, review/reconcile its Runs, and cancel it before replacing settings. If the web server holds the data-directory lock, use its settings panel or stop it before using the CLI wizard.
+
+Workspace selection: click **自动创建工作区 → 浏览文件夹…**, navigate folders, then **选择此文件夹** (applies immediately and returns to the composer). The same picker can select Agent executables and package directories. Absolute-path entry remains available. The picker lists names and paths on this local machine, without uploading files or reading their contents; it is a user-facing management action, not a model tool.
+
 ## Commands
 
 ```text
@@ -55,3 +79,31 @@ agent-center cancel TASK_ID --yes
 ```
 
 `--live` is an explicit real-service probe and can incur provider usage. It must not be used unless local credentials, budget, and authorization are in place. At present, do not assume the live path is compatible; consult `docs/COMPATIBILITY.md` and `docs/ACCEPTANCE_REPORT.md`.
+
+### Connection form and server upgrades
+
+Choosing Codex or DeepSeek in the web form now detects its installation automatically. Manual executable/package paths live under advanced settings. Model ID is the exact model name supplied by your model service; Base URL is its API root, not its website. Codex supports its existing official login or a custom Responses-compatible endpoint. DeepSeek uses the Harness provider route and `DEEPSEEK_BASE_URL` for an explicitly configured endpoint.
+
+For custom APIs, select the credential environment variable (Codex: `OPENAI_API_KEY` or `CODEX_API_KEY`; DeepSeek: `DEEPSEEK_API_KEY`) and set its value in the terminal before starting the web server. You may also paste an API key in the web form for the current server process only. The input is cleared after saving; keys are never written to registration files or returned by the API. Restarting the server discards these session keys. CLI registration accepts the same `--base-url` and `--api-key-env` options. Endpoint overrides apply only to that Agent invocation, with no native config changes. Live authentication/model routing remains unverified until separately tested.
+
+After updating source, restart `agent-center web` and refresh the page. The server now holds a matching frontend snapshot for its lifetime, and the frontend checks API revision so a stale backend produces a restart instruction instead of a blank picker. File selection lists folders for workspaces, and executable files for CLI selection; enable “显示隐藏目录” to navigate `.local` or other hidden installation folders.
+
+### Codex subscription login
+
+The Agent form defaults to **Codex 订阅登录** and reuses local Codex authentication. No Base URL or API key is required. Leave the model field empty to use Codex's default model; the adapter omits `--model` in this case. API fields appear only for a custom API connection. Manual paths, permissions and replacement options are collapsed under advanced settings.
+
+### Model and reasoning selection
+
+Opening the Add Agent form detects the installation and reads its model catalog automatically. Codex subscription models and supported reasoning efforts come from the CLI's native `app-server` `model/list` response. DeepSeek uses the installed Harness provider's native model/effort metadata, labeled as a local catalog rather than account authorization. Custom API connections query their `/models` endpoint only after the user supplies the address; no redirects are followed with credentials. If the endpoint provides no reasoning metadata, the selector offers only model default. Detection failure permits an explicit manual Model ID; it never presents a hardcoded list as discovered.
+
+Choosing a model updates the reasoning selector to that model's declared choices. Both values are saved in the registration and passed to the existing CLI adapters. Interactive CLI registration also presents the native catalog and reasoning choices; scripted registration accepts `--model` and `--reasoning-effort`. Catalog discovery creates no task/thread and runs no project code.
+
+“CLI 程序位置” is the installed CLI launcher, such as the `codex` executable resolved from PATH or the DeepSeek Harness app launcher. It is not the task workspace. Normally automatic detection fills it in and there is no need to edit it.
+
+### Supervisor settings and task recovery
+
+Open **连接与能力 → 配置统筹模型** (also available from the composer) to select the supervisor API protocol, model and optional reasoning effort, timeout and output limit. This is separate from Agent profiles. Model parameters and environment variable names share the existing `config.toml.agents.json` overlay; the base TOML is preserved, including when it does not exist yet. Optional address/key inputs update only the current server process environment. The form never displays existing values; provide the configured variables again after restarting. Supervisor variables cannot overlap Agent credential variables.
+
+The workbench selects the current unfinished task after refresh. **新建任务** opens that task while single-task mode is occupied, and sending adds a follow-up rather than creating another task. Paused tasks can resume on a follow-up. Blocked or interrupted tasks show **检查与对账**: inspect Run status, log paths and workspace effects, confirm processes have stopped, and type the task ID. Live or ambiguous process identities prevent reconciliation. Reviewed Runs are recorded as reconciled, with original state saved in the event history; old Runs are never replayed. Continue creates a fresh plan, or cancel to release the task slot. No task is silently cancelled and budgets/evidence/history are retained.
+
+The settings panel shows connection health and essential Agent identity by default. Expand **能力与安装详情** for capability evidence and installation identity; a configured connection is not proof of live API availability.

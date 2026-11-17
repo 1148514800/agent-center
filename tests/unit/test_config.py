@@ -28,7 +28,7 @@ def test_model_placeholder_rejected_for_live_api(config: AppConfiguration, monke
     )
     monkeypatch.setenv("AGENT_CENTER_BASE_URL", "https://example.invalid")
     monkeypatch.setenv("AGENT_CENTER_API_KEY", "synthetic-secret")
-    with pytest.raises(ValueError, match="placeholder"):
+    with pytest.raises(ValueError, match="统筹模型尚未配置"):
         config.supervisor_endpoint()
 
 

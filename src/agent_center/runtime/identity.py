@@ -45,6 +45,12 @@ def verify_process_identity(pid: int, executable: str, start_identity: str, stor
     """True means identity matched; False means absent; None means the PID is ambiguous."""
     if pid <= 0:
         return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        return None
     if not executable or not start_identity or not stored_command:
         return None
     if os.uname().sysname != "Darwin":

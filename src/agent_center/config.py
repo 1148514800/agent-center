@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from pathlib import Path
 from typing import Literal
@@ -28,6 +29,24 @@ class SupervisorConfig(StrictConfig):
     request_timeout_seconds: int = Field(default=120, ge=1, le=900)
     max_output_tokens: int = Field(default=4096, ge=1, le=65536)
     reasoning_effort: str = ""
+
+    @model_validator(mode="after")
+    def validate_settings(self) -> SupervisorConfig:
+        # These variables must never overlap the environment forwarded to native agents.
+        reserved = {
+            "HOME", "PATH", "LANG", "CODEX_HOME", "OPENAI_API_KEY", "CODEX_API_KEY",
+            "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "ELECTRON_RUN_AS_NODE", "TMPDIR",
+        }
+        for name in (self.base_url_env, self.api_key_env):
+            if not re.fullmatch(r"[A-Z_][A-Z0-9_]*", name) or name in reserved:
+                raise ValueError("统筹环境变量名称无效，或与 Agent / 系统环境冲突")
+        if self.base_url_env == self.api_key_env:
+            raise ValueError("统筹地址和密钥必须使用不同环境变量")
+        if not self.model.strip() or len(self.model) > 200:
+            raise ValueError("请输入统筹模型 ID")
+        if self.reasoning_effort not in {"", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}:
+            raise ValueError("无效的统筹思考强度")
+        return self
 
 
 class LimitsConfig(StrictConfig):
@@ -68,10 +87,31 @@ class ProfileConfig(StrictConfig):
     agent_id: Literal["codex", "deepseek"]
     model: str
     provider: str = ""
+    base_url: str = ""
+    api_key_env: Literal["", "OPENAI_API_KEY", "CODEX_API_KEY", "DEEPSEEK_API_KEY"] = ""
     auth_mode: Literal["existing_cli"] = "existing_cli"
     permission_mode: Literal["workspace-write", "read-only"] = "workspace-write"
     reasoning_effort: str = ""
     credential_env: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_connection(self) -> ProfileConfig:
+        if self.base_url:
+            parsed = urlsplit(self.base_url)
+            if (
+                not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.query
+                or parsed.fragment
+                or parsed.scheme not in {"http", "https"}
+                or (parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"})
+            ):
+                raise ValueError("Base URL 必须是 HTTPS API 地址（本机地址可用 HTTP），不能包含密钥或查询参数")
+        allowed = {"", "OPENAI_API_KEY", "CODEX_API_KEY"} if self.agent_id == "codex" else {"", "DEEPSEEK_API_KEY"}
+        if self.api_key_env not in allowed:
+            raise ValueError("API Key 环境变量不适用于此 Agent")
+        return self
 
 
 class AppConfiguration(StrictConfig):
@@ -98,7 +138,7 @@ class AppConfiguration(StrictConfig):
                 raise ValueError(f"Profile {agent.default_profile} belongs to a different agent")
             if not set(profile.credential_env).issubset(allowed_credentials[agent_id]):
                 raise ValueError(f"Agent profile {agent.default_profile} requests an unsupported credential variable")
-            if protected.intersection(profile.credential_env):
+            if profile.api_key_env in protected or protected.intersection(profile.credential_env):
                 raise ValueError("Supervisor API credentials cannot be forwarded to an Agent")
         return self
 
@@ -107,8 +147,8 @@ class AppConfiguration(StrictConfig):
         api_key = os.environ.get(self.supervisor.api_key_env, "").strip()
         if not base_url or not api_key:
             raise ValueError(
-                f"Set {self.supervisor.base_url_env} and {self.supervisor.api_key_env} "
-                "in the local environment before making an API call"
+                "请在连接与能力中配置统筹模型的地址和密钥，或设置环境变量 "
+                f"{self.supervisor.base_url_env} / {self.supervisor.api_key_env}"
             )
         parsed = urlsplit(base_url)
         if parsed.scheme not in {"https", "http"} or not parsed.hostname or parsed.username or parsed.password:
@@ -118,7 +158,7 @@ class AppConfiguration(StrictConfig):
         if parsed.query or parsed.fragment:
             raise ValueError("Supervisor base URL cannot contain a query or fragment")
         if "REPLACE_WITH" in self.supervisor.model:
-            raise ValueError("Supervisor model is still a placeholder")
+            raise ValueError("统筹模型尚未配置，请打开连接与能力并填写实际模型 ID")
         return base_url.rstrip("/"), api_key, self.supervisor.model
 
 
@@ -180,7 +220,9 @@ def default_config_path() -> Path:
 def load_config(path: Path) -> AppConfiguration:
     with path.expanduser().open("rb") as stream:
         raw = tomllib.load(stream)
-    config = AppConfiguration.model_validate(raw)
+    from agent_center.setup import apply_registrations
+
+    config = apply_registrations(AppConfiguration.model_validate(raw), path)
     if "REPLACE_WITH" in config.supervisor.model:
         # Placeholders are allowed for offline setup and reported by doctor; live calls reject them.
         pass

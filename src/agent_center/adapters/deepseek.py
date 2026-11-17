@@ -83,6 +83,8 @@ class DeepSeekHeadlessAdapter:
         for name in request.profile.credential_env:
             if name in {"DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"} and name in os.environ:
                 env[name] = os.environ[name]
+        if request.profile.base_url:
+            env["DEEPSEEK_BASE_URL"] = request.profile.base_url
         return LaunchSpec(str(executable), tuple([str(cli_entry), *argv]), env, prompt, "dsh-headless-json-v1")
 
     def parse(self, request: AgentRequest, process: ProcessResult) -> AgentRunResult:
