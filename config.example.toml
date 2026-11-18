@@ -11,7 +11,8 @@ api_key_env = "AGENT_CENTER_API_KEY"
 model = "REPLACE_WITH_AVAILABLE_MODEL_ID"
 request_timeout_seconds = 120
 max_output_tokens = 4096
-reasoning_effort = "" # Reserved; unsupported settings are rejected by the API adapter.
+reasoning_effort = "" # Automatic: omit the field; explicit values require known model support.
+# Web saves durable settings + credentials to config.toml.supervisor.json (0600), never this TOML.
 
 [limits]
 max_agent_calls = 12
@@ -33,6 +34,8 @@ allow_global_install = false
 allow_external_publish = false
 
 [agents.codex]
+# Optional user_added = true marks an explicitly added Agent, even with a CLI-default model.
+# Legacy entries with concrete model IDs remain visible without this field.
 enabled = true
 adapter = "codex_exec"
 executable = "codex"

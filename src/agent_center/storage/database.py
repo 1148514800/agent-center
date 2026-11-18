@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS tasks(
  config_snapshot TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  agent_calls INTEGER NOT NULL DEFAULT 0, supervisor_calls INTEGER NOT NULL DEFAULT 0,
  active_seconds REAL NOT NULL DEFAULT 0, active_started_at REAL, plan_json TEXT NOT NULL DEFAULT '[]',
- last_error TEXT, criteria_json TEXT NOT NULL DEFAULT '[]', execution_required INTEGER NOT NULL DEFAULT 0,
+ last_error TEXT, criteria_json TEXT NOT NULL DEFAULT '[]',
  pending_approval_id TEXT, pending_action_json TEXT
 );
 CREATE TABLE IF NOT EXISTS messages(
@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS evidence_criteria(
  evidence_id TEXT NOT NULL REFERENCES evidence(evidence_id), criterion_id TEXT NOT NULL,
  PRIMARY KEY(evidence_id,criterion_id)
 );
+CREATE TABLE IF NOT EXISTS conversations(
+ conversation_id TEXT PRIMARY KEY, created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chat_messages(
+ message_id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(conversation_id),
+ sequence INTEGER NOT NULL, text TEXT NOT NULL, answer TEXT NOT NULL DEFAULT '',
+ status TEXT NOT NULL DEFAULT 'pending', reason TEXT NOT NULL DEFAULT '', workspace TEXT NOT NULL DEFAULT '',
+ task_id TEXT REFERENCES tasks(task_id) ON DELETE SET NULL, created_at TEXT NOT NULL,
+ UNIQUE(conversation_id,sequence)
+);
 CREATE INDEX IF NOT EXISTS idx_tasks_updated ON tasks(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_task_seq ON events(task_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_messages_inbox ON messages(task_id, applied_at, sequence);
@@ -78,78 +88,6 @@ def new_id(prefix: str) -> str:
 
 def canonical(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-
-
-def is_execution_request(goal: str) -> bool:
-    """Default to execution-required; only unmistakable informational questions can answer directly."""
-    text = goal.strip().casefold()
-    informational_prefixes = (
-        "what is",
-        "what are",
-        "what's",
-        "what was",
-        "what were",
-        "who was",
-        "where was",
-        "when was",
-        "how can i understand",
-        "how should i think about",
-        "tell me what",
-        "explain what",
-        "define what",
-        "why is",
-        "why are",
-        "how does",
-        "how do",
-        "how is",
-        "who is",
-        "when is",
-        "where is",
-        "explain ",
-        "define ",
-        "compare ",
-        "what does",
-        "什么是",
-        "什么叫",
-        "是什么",
-        "为什么",
-        "怎么回事",
-        "是什么原理",
-        "原理是什么",
-        "怎么理解",
-        "如何理解",
-        "解释一下",
-        "请解释",
-        "请说明",
-        "请问",
-        "说明一下",
-        "区别是什么",
-    )
-    if text.startswith(informational_prefixes):
-        actionable = (
-            " and then implement",
-            " and fix",
-            " and update",
-            " to the project",
-            " in the project",
-            "write code",
-            "change files",
-            "edit files",
-            "modify files",
-            "run tests",
-            "并实现",
-            "并修改",
-            "并添加",
-            "并修复",
-            "帮我改",
-            "帮我做",
-            "请实现",
-            "请修改",
-            "请添加",
-            "请编写",
-        )
-        return any(marker in text for marker in actionable)
-    return True
 
 
 class WorkspaceLock:
@@ -192,9 +130,11 @@ class Store:
         self._migrate()
 
     def _migrate(self) -> None:
+        self._connection.execute("INSERT OR IGNORE INTO schema_migrations VALUES(7, ?)", (now(),))
         columns = {row[1] for row in self._connection.execute("PRAGMA table_info(tasks)")}
-        if "execution_required" not in columns:
-            self._connection.execute("ALTER TABLE tasks ADD COLUMN execution_required INTEGER NOT NULL DEFAULT 0")
+        if "execution_required" in columns:
+            self._connection.execute("ALTER TABLE tasks DROP COLUMN execution_required")
+        self._connection.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES(6, ?)", (now(),))
         if "active_started_at" not in columns:
             self._connection.execute("ALTER TABLE tasks ADD COLUMN active_started_at REAL")
         if "pending_action_json" not in columns:
@@ -256,15 +196,69 @@ class Store:
             ),
         )
 
+    def create_conversation(self) -> str:
+        conversation_id = new_id("chat")
+        self._connection.execute("INSERT INTO conversations VALUES(?,?)", (conversation_id, now()))
+        return conversation_id
+
+    def conversation(self, conversation_id: str) -> dict[str, Any]:
+        if not self._connection.execute(
+            "SELECT 1 FROM conversations WHERE conversation_id=?", (conversation_id,)
+        ).fetchone():
+            raise ValueError("会话不存在")
+        messages = [dict(row) for row in self._connection.execute(
+            "SELECT * FROM chat_messages WHERE conversation_id=? ORDER BY sequence", (conversation_id,))]
+        return {"conversation_id": conversation_id, "messages": messages}
+
+    def list_conversations(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._connection.execute(
+            "SELECT c.conversation_id, COALESCE((SELECT text FROM chat_messages m "
+            "WHERE m.conversation_id=c.conversation_id ORDER BY sequence LIMIT 1),'新会话') AS title "
+            "FROM conversations c ORDER BY c.rowid DESC LIMIT 100")]
+
+    def add_chat_message(self, conversation_id: str, text: str, workspace: str) -> str:
+        self.conversation(conversation_id)
+        message_id = new_id("chatmsg")
+        with self.transaction() as conn:
+            sequence = conn.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM chat_messages WHERE conversation_id=?",
+                (conversation_id,)).fetchone()[0]
+            conn.execute(
+                "INSERT INTO chat_messages(message_id,conversation_id,sequence,text,workspace,created_at) "
+                "VALUES(?,?,?,?,?,?)", (message_id, conversation_id, sequence, redact_text(text), workspace, now()))
+        return message_id
+
+    def update_chat_message(self, message_id: str, *, status: str, answer: str = "", reason: str = "",
+                            task_id: str | None = None) -> None:
+        self._connection.execute(
+            "UPDATE chat_messages SET status=?,answer=?,reason=?,task_id=? WHERE message_id=?",
+            (status, redact_text(answer), redact_text(reason), task_id, message_id))
+
+    def delete_task(self, task_id: str) -> None:
+        """Delete internal rows only. Workspace files and CLI logs are never followed/deleted."""
+        with self.transaction() as conn:
+            task = conn.execute("SELECT * FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+            if task is None:
+                raise ValueError("任务不存在")
+            unsafe = conn.execute(
+                "SELECT 1 FROM runs WHERE task_id=? AND (status NOT IN ('completed','reconciled','failed') "
+                "OR (status IN ('completed','failed') AND event_complete=0))", (task_id,)).fetchone()
+            if task["active_started_at"] is not None or task["status"] in {"running", "verifying"} or unsafe:
+                raise ValueError("请先停止 / 取消运行并对账，再删除任务")
+            conn.execute("DELETE FROM evidence_criteria WHERE evidence_id IN "
+                         "(SELECT evidence_id FROM evidence WHERE task_id=?)", (task_id,))
+            for table in ("evidence", "approvals", "events", "runs", "messages"):
+                conn.execute(f"DELETE FROM {table} WHERE task_id=?", (task_id,))
+            conn.execute("DELETE FROM tasks WHERE task_id=?", (task_id,))
+
     def create_task(self, goal: str, workspace: Path, snapshot: dict[str, Any]) -> str:
         goal = redact_text(goal)
         task_id = new_id("task")
         stamp = now()
         with self.transaction() as conn:
             conn.execute(
-                "INSERT INTO tasks(task_id,goal,workspace,status,config_snapshot,created_at,updated_at,"
-                "execution_required) "
-                "VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO tasks(task_id,goal,workspace,status,config_snapshot,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?)",
                 (
                     task_id,
                     goal,
@@ -273,7 +267,6 @@ class Store:
                     canonical(snapshot),
                     stamp,
                     stamp,
-                    int(is_execution_request(goal)),
                 ),
             )
             conn.execute(
@@ -316,11 +309,6 @@ class Store:
                 return int(task[0])
             version = task[0] + 1
             stamp = now()
-            pending_text = conn.execute(
-                "SELECT text FROM messages WHERE task_id=? AND applied_at IS NULL ORDER BY sequence",
-                (task_id,),
-            ).fetchall()
-            requires_execution = any(is_execution_request(item[0]) for item in pending_text)
             for message in pending:
                 conn.execute(
                     "UPDATE messages SET applied_at=?, applied_version=? WHERE message_id=?",
@@ -328,9 +316,9 @@ class Store:
                 )
             conn.execute(
                 "UPDATE tasks SET requirements_version=?,state_version=state_version+1,updated_at=?,"
-                "plan_json='[]',criteria_json='[]',execution_required=MAX(execution_required,?) "
+                "plan_json='[]',criteria_json='[]' "
                 "WHERE task_id=?",
-                (version, stamp, int(requires_execution), task_id),
+                (version, stamp, task_id),
             )
             changed_approvals = conn.execute(
                 "SELECT approval_id FROM approvals WHERE task_id=? AND status IN ('pending','approved')",
@@ -445,7 +433,7 @@ class Store:
         run_id = new_id("run")
         with self.transaction() as conn:
             task = conn.execute(
-                "SELECT requirements_version,status,execution_required,criteria_json FROM tasks WHERE task_id=?",
+                "SELECT requirements_version,status,criteria_json FROM tasks WHERE task_id=?",
                 (task_id,),
             ).fetchone()
             if task is None:
@@ -463,7 +451,7 @@ class Store:
                 raise RuntimeError("An unresolved run exists; reconcile it before starting another")
             if task[1] not in {TaskStatus.PLANNING, TaskStatus.CREATED, TaskStatus.VERIFYING}:
                 raise RuntimeError(f"Task status {task[1]} does not permit a new run; reconcile or re-plan first")
-            if task[2] and not json.loads(task[3]):
+            if not json.loads(task[2]):
                 raise RuntimeError("Execution task is missing a saved plan and verifiable criteria")
             conn.execute(
                 "INSERT INTO runs(run_id,task_id,agent_id,status,requirements_version,config_snapshot,"
@@ -690,6 +678,26 @@ class Store:
                     (evidence_id, criterion_id),
                 )
 
+    def has_execution_work(self, task_id: str) -> bool:
+        return self._has_execution_work(self._connection, task_id)
+
+    @staticmethod
+    def _has_execution_work(conn: sqlite3.Connection, task_id: str) -> bool:
+        """Track work selected by the supervisor, without classifying user text."""
+        task = conn.execute(
+            "SELECT agent_calls,plan_json,criteria_json FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if task is None:
+            raise KeyError(task_id)
+        if task[0] or json.loads(task[1]) or json.loads(task[2]):
+            return True
+        if conn.execute("SELECT 1 FROM runs WHERE task_id=? LIMIT 1", (task_id,)).fetchone():
+            return True
+        # Applying new requirements and reconciliation clear the current plan, not its history.
+        return conn.execute(
+            "SELECT 1 FROM events WHERE task_id=? AND type='plan_updated' LIMIT 1", (task_id,)
+        ).fetchone() is not None
+
     def finish_if_current(
         self,
         task_id: str,
@@ -699,7 +707,7 @@ class Store:
     ) -> bool:
         with self.transaction() as conn:
             task = conn.execute(
-                "SELECT requirements_version,status,execution_required,criteria_json,plan_json "
+                "SELECT requirements_version,status,criteria_json,plan_json "
                 "FROM tasks WHERE task_id=?",
                 (task_id,),
             ).fetchone()
@@ -733,10 +741,8 @@ class Store:
                 return False
             if task[1] != TaskStatus.VERIFYING:
                 return False
-            required = json.loads(task[3])
-            if task[2] and not required:
-                return False
-            if task[2] and not required_criteria:
+            required = json.loads(task[2])
+            if self._has_execution_work(conn, task_id) and (not required or not required_criteria):
                 return False
             if required and required_criteria is None:
                 return False
@@ -775,7 +781,7 @@ class Store:
                     (
                         task_id,
                         requirements_version,
-                        hashlib.sha256(task[4].encode()).hexdigest(),
+                        hashlib.sha256(task[3].encode()).hexdigest(),
                         *evidence_ids,
                         criterion_id,
                     ),
@@ -869,7 +875,7 @@ class Store:
             safe_plan = redact_value(plan)
             safe_criteria = sorted({criterion["id"] for step in safe_plan for criterion in step["acceptance_criteria"]})
             conn.execute(
-                "UPDATE tasks SET plan_json=?,criteria_json=?,execution_required=1,updated_at=? WHERE task_id=?",
+                "UPDATE tasks SET plan_json=?,criteria_json=?,updated_at=? WHERE task_id=?",
                 (canonical(safe_plan), canonical(safe_criteria), now(), task_id),
             )
             self.emit(
@@ -885,7 +891,8 @@ class Store:
 
     def unresolved_runs(self) -> list[dict[str, Any]]:
         rows = self._connection.execute(
-            "SELECT * FROM runs WHERE status IN ('prepared','starting','running','unknown') ORDER BY rowid"
+            "SELECT * FROM runs WHERE status IN ('prepared','starting','running','unknown','cancelled','timed_out') "
+            "OR (status='failed' AND event_complete=0) ORDER BY rowid"
         ).fetchall()
         return [dict(row) for row in rows]
 

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
 from agent_center.capabilities import AgentCapabilities
 
@@ -48,6 +48,19 @@ class SupervisorConfig(StrictConfig):
             raise ValueError("无效的统筹思考强度")
         return self
 
+    def validate_protocol_options(self) -> None:
+        """Validate before saving/sending while allowing old config files to load for repair."""
+        if self.reasoning_effort:
+            # Compatible providers with unknown model IDs should use automatic/default.
+            supported = {"o3": {"low", "medium", "high"}, "o4-mini": {"low", "medium", "high"},
+                         "gpt-5": {"minimal", "low", "medium", "high"},
+                         "gpt-5-mini": {"minimal", "low", "medium", "high"},
+                         "gpt-5-nano": {"minimal", "low", "medium", "high"},
+                         "gpt-5.1": {"none", "low", "medium", "high"},
+                         "gpt-5.2": {"none", "low", "medium", "high", "xhigh"}}
+            if self.reasoning_effort not in supported.get(self.model, set()):
+                raise ValueError("此协议 / 模型未确认支持所选思考强度，请选择模型默认")
+
 
 class LimitsConfig(StrictConfig):
     max_agent_calls: int = Field(default=12, ge=1, le=1000)
@@ -72,6 +85,7 @@ class PolicyConfig(StrictConfig):
 
 class AgentConfig(StrictConfig):
     enabled: bool = True
+    user_added: bool | None = None  # None preserves legacy configured-agent compatibility.
     adapter: Literal["codex_exec", "deepseek_headless"]
     executable: str
     description: str
@@ -115,6 +129,8 @@ class ProfileConfig(StrictConfig):
 
 
 class AppConfiguration(StrictConfig):
+    _local_connection: dict[str, str] = PrivateAttr(default_factory=dict)
+
     schema_version: Literal[1]
     app: AppConfig
     supervisor: SupervisorConfig
@@ -143,8 +159,8 @@ class AppConfiguration(StrictConfig):
         return self
 
     def supervisor_endpoint(self) -> tuple[str, str, str]:
-        base_url = os.environ.get(self.supervisor.base_url_env, "").strip()
-        api_key = os.environ.get(self.supervisor.api_key_env, "").strip()
+        base_url = self._local_connection.get("base_url", os.environ.get(self.supervisor.base_url_env, "")).strip()
+        api_key = self._local_connection.get("api_key", os.environ.get(self.supervisor.api_key_env, "")).strip()
         if not base_url or not api_key:
             raise ValueError(
                 "请在连接与能力中配置统筹模型的地址和密钥，或设置环境变量 "
@@ -174,6 +190,7 @@ def offline_default_configuration() -> AppConfiguration:
             },
             "agents": {
                 "codex": {
+                    "user_added": False,
                     "adapter": "codex_exec",
                     "executable": "codex",
                     "description": "Offline probe only; execution disabled.",
@@ -182,6 +199,7 @@ def offline_default_configuration() -> AppConfiguration:
                     "allow_execution": False,
                 },
                 "deepseek": {
+                    "user_added": False,
                     "adapter": "deepseek_headless",
                     "executable": "/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness",
                     "cli_install_dir": (
@@ -227,3 +245,10 @@ def load_config(path: Path) -> AppConfiguration:
         # Placeholders are allowed for offline setup and reported by doctor; live calls reject them.
         pass
     return config
+
+
+def added_agents(config: AppConfiguration) -> dict[str, AgentConfig]:
+    """Discovery defaults are not registrations; legacy concrete TOML entries still are."""
+    return {name: agent for name, agent in config.agents.items()
+            if agent.user_added is True or (agent.user_added is None
+                and "REPLACE_WITH" not in config.profiles[agent.default_profile].model)}

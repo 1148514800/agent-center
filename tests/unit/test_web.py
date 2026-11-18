@@ -13,10 +13,19 @@ from agent_center.web_server import WebApplication, serve
 
 
 @pytest.mark.asyncio
-async def test_web_task_creation_preserves_configuration_gates(config: AppConfiguration, store: Store) -> None:
+async def test_web_task_creation_preserves_configuration_gates(
+    config: AppConfiguration, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
     app = WebApplication(TaskEngine(config, store), store)
+    from unittest.mock import AsyncMock
+
+    from agent_center.domain import ExecutionRequest
+
+    monkeypatch.setattr(app.engine.model, "route", AsyncMock(return_value=ExecutionRequest(
+        action="request_execution", reason_summary="Needs CLI")))
     result = await app.api("POST", "/api/tasks", {"goal": "Implement a feature"})
-    task_id = result["task"]["task_id"]
+    task_id = result["task_id"]
+    result = app.detail(task_id)
     assert result["task"]["status"] == "blocked"
     assert result["task"]["last_error"]
     assert not store.runs(task_id)
@@ -30,6 +39,7 @@ async def test_web_task_creation_preserves_configuration_gates(config: AppConfig
 async def test_web_rejects_resume_with_unresolved_run(config: AppConfiguration, store: Store, tmp_path: Path) -> None:
     engine = TaskEngine(config, store)
     task_id, _ = engine.create_task("Implement", tmp_path)
+    prepare_run(engine, task_id, tmp_path)
     store._connection.execute("UPDATE tasks SET status='interrupted' WHERE task_id=?", (task_id,))
     app = WebApplication(engine, store)
     with pytest.raises(ValueError):
@@ -44,39 +54,63 @@ async def test_web_rejects_resume_with_unresolved_run(config: AppConfiguration, 
         )
     with pytest.raises(ValueError):
         await app.api("POST", f"/api/tasks/{task_id}/resume", {})
-    assert not store.runs(task_id)
+    assert store.runs(task_id)[0]["status"] == "unknown"
 
 
 @pytest.mark.asyncio
-async def test_http_origin_host_and_csrf_guards(config: AppConfiguration, store: Store) -> None:
+async def test_http_origin_host_and_csrf_guards(
+    config: AppConfiguration, store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import json
     import re
-    import socket
+    from unittest.mock import AsyncMock, MagicMock, Mock
 
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
+    # Exercise the real HTTP handler with in-memory streams, including in socket-restricted sandboxes.
+    port = 18765
+    started = asyncio.Event()
+    server = MagicMock()
+    server.__aenter__.return_value = server
+
+    async def serve_forever() -> None:
+        started.set()
+        await asyncio.Future()
+
+    server.serve_forever = AsyncMock(side_effect=serve_forever)
+    start_server = AsyncMock(return_value=server)
+    monkeypatch.setattr(asyncio, "start_server", start_server)
     running = asyncio.create_task(serve(TaskEngine(config, store), store, port, open_browser=False))
+    await asyncio.wait_for(started.wait(), 2)
+    start_server.assert_called_once()
+    handler = start_server.call_args.args[0]
+    assert start_server.call_args.args[1:] == ("127.0.0.1", port)
 
     async def request(headers: str, method: str = "GET", path: str = "/", body: bytes = b"") -> bytes:
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
-        writer.write(f"{method} {path} HTTP/1.1\r\n{headers}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body)
-        await writer.drain()
-        response = await reader.read()
-        writer.close()
-        await writer.wait_closed()
-        return response
+        reader = asyncio.StreamReader()
+        reader.feed_data(
+            f"{method} {path} HTTP/1.1\r\n{headers}\r\nContent-Length: {len(body)}\r\n\r\n".encode() + body
+        )
+        reader.feed_eof()
+        writer = Mock(drain=AsyncMock(), wait_closed=AsyncMock())
+        await handler(reader, writer)
+        writer.close.assert_called_once()
+        return writer.write.call_args.args[0]
 
     try:
-        for _ in range(50):
-            try:
-                response = await request(f"Host: 127.0.0.1:{port}")
-                break
-            except ConnectionRefusedError:
-                await asyncio.sleep(0.01)
-        else:
-            pytest.fail("Server did not start")
+        response = await request(f"Host: 127.0.0.1:{port}")
         assert b"200 OK" in response and b"__CSRF_TOKEN__" not in response
+        for splitter_id, orientation, controls in (
+            ("sidebar-split", "vertical", "sidebar"),
+            ("history-split", "horizontal", "tasks chats"),
+            ("reading-split", "horizontal", "reading-pane prompt"),
+        ):
+            splitter = re.search(fr'<div id="{splitter_id}"[^>]*>'.encode(), response)
+            assert splitter
+            for attribute in (
+                'role="separator"', 'tabindex="0"', 'aria-label="',
+                f'aria-controls="{controls}"', f'aria-orientation="{orientation}"',
+            ):
+                assert attribute.encode() in splitter[0]
+        assert b'id="reset-layout"' in response
         assert b"400 Bad Request" in await request("Host: attacker.example")
         assert b"400 Bad Request" in await request(f"Host: 127.0.0.1:{port}\r\nOrigin: https://attacker.example")
         assert b"400 Bad Request" in await request(f"Host: 127.0.0.1:{port}", "POST", "/api/tasks")
@@ -89,7 +123,14 @@ async def test_http_origin_host_and_csrf_guards(config: AppConfiguration, store:
         assert b"200 OK" in directory
         assert "entries" in json.loads(directory.split(b"\r\n\r\n", 1)[1])
         state = await request(f"Host: 127.0.0.1:{port}", path="/api/state")
-        assert json.loads(state.split(b"\r\n\r\n", 1)[1])["api_revision"] == 3
+        assert json.loads(state.split(b"\r\n\r\n", 1)[1])["api_revision"] == 4
+        task_id = store.create_task("Synthetic task", store.data_dir, {})
+        delete_path = f"/api/tasks/{task_id}/delete"
+        body = json.dumps({"confirmation": task_id}).encode()
+        assert b"400 Bad Request" in await request(f"Host: 127.0.0.1:{port}", "POST", delete_path, body)
+        assert store.task(task_id)
+        deleted = await request(headers, "POST", delete_path, body)
+        assert b"200 OK" in deleted and json.loads(deleted.split(b"\r\n\r\n", 1)[1]) == {"deleted": task_id}
         assert not store.list_tasks()
     finally:
         running.cancel()
@@ -106,6 +147,22 @@ def prepare_run(engine: TaskEngine, task_id: str, tmp_path: Path, status: str = 
     return run_id
 
 
+@pytest.mark.parametrize("run_status", ["running", "unknown", "failed"])
+async def test_sidebar_delete_endpoint_refuses_protected_runs(
+    config: AppConfiguration, store: Store, tmp_path: Path, run_status: str,
+) -> None:
+    app = WebApplication(TaskEngine(config, store), store)
+    task_id, _ = app.engine.create_task("Synthetic task", tmp_path)
+    run_id = prepare_run(app.engine, task_id, tmp_path, run_status)
+    store.set_status(task_id, TaskStatus.CANCELLED)
+
+    with pytest.raises(ValueError, match="停止 / 取消运行并对账"):
+        await app.api("POST", f"/api/tasks/{task_id}/delete", {"confirmation": task_id})
+
+    assert store.task(task_id)
+    assert store.runs(task_id)[0]["run_id"] == run_id
+
+
 @pytest.mark.asyncio
 async def test_active_task_is_discoverable_and_accepts_followups_without_a_second_task(
     config: AppConfiguration, store: Store, tmp_path: Path
@@ -118,8 +175,15 @@ async def test_active_task_is_discoverable_and_accepts_followups_without_a_secon
     assert state["active_task_id"] == task_id
     result = await app.api("POST", f"/api/tasks/{task_id}/message", {"text": "Continue this task"})
     assert result["messages"][-1]["text"] == "Continue this task"
-    with pytest.raises(RuntimeError, match=task_id):
-        await app.api("POST", "/api/tasks", {"goal": "Second"})
+    from unittest.mock import AsyncMock
+
+    from agent_center.domain import ExecutionRequest
+
+    app.engine.model.route = AsyncMock(return_value=ExecutionRequest(
+        action="request_execution", reason_summary="Needs CLI"))
+    result = await app.api("POST", "/api/tasks", {"goal": "Second"})
+    assert result["messages"][-1]["status"] == "execution_blocked"
+    assert task_id in result["messages"][-1]["reason"]
     assert len(store.list_tasks()) == 1
 
 
@@ -164,6 +228,7 @@ async def test_stale_task_can_be_reviewed_then_cancelled_without_losing_history(
 ) -> None:
     engine = TaskEngine(config, store)
     task_id, _ = engine.create_task("First", tmp_path)
+    prepare_run(engine, task_id, tmp_path)
     store._connection.execute("UPDATE tasks SET status=? WHERE task_id=?", (status, task_id))
     app = WebApplication(engine, store)
     assert app.detail(task_id)["recovery"]["needs_review"]
@@ -202,6 +267,48 @@ async def test_unknown_run_requires_review_and_is_never_replayed(
     assert result["recovery"]["can_resume"]
     await app.api("POST", f"/api/tasks/{task_id}/cancel", {})
     assert store.task(task_id)["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["blocked", "interrupted", "planning", "running", "verifying"])
+@pytest.mark.parametrize("action", ["resume", "cancel"])
+async def test_no_run_failure_can_resume_or_cancel_without_reconciliation(
+    config: AppConfiguration, store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    status: str, action: str,
+) -> None:
+    import httpx
+
+    from agent_center.supervisor import ModelClient
+
+    monkeypatch.setenv("AGENT_CENTER_BASE_URL", "https://synthetic.invalid/v1")
+    monkeypatch.setenv("AGENT_CENTER_API_KEY", "SYNTHETIC_RECOVERY_TEST_VALUE")
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"choices": [{"message": {"content": "你好！"}}]})
+
+    engine = TaskEngine(config, store, model_client=ModelClient(config, transport=httpx.MockTransport(respond)))
+    task_id, _ = engine.create_task("你好", tmp_path)
+    error = "Multiple tool calls (2): inspect, delegate"
+    store._connection.execute(
+        "UPDATE tasks SET status=?,last_error=?,supervisor_calls=6 WHERE task_id=?",
+        (status, error, task_id),
+    )
+    app = WebApplication(engine, store)
+    recovery = (await app.api("GET", f"/api/tasks/{task_id}", {}))["recovery"]
+    assert recovery["can_resume"] and not recovery["needs_review"]
+    assert not recovery["can_reconcile"]
+    assert error in recovery["hint"]
+    assert all(word not in recovery["hint"] for word in ["Run", "日志", "工作区", "对账"])
+    await app.api("POST", f"/api/tasks/{task_id}/{action}", {})
+    if action == "resume":
+        await app.jobs[task_id]
+    assert store.task(task_id)["status"] == ("succeeded" if action == "resume" else "cancelled")
+    assert len(requests) == (1 if action == "resume" else 0)
+    assert store.task(task_id)["supervisor_calls"] == (7 if action == "resume" else 6)
+    assert not store.runs(task_id)
+    assert not any(e["type"] == "runs_reconciled" for e in store.events(task_id))
 
 
 @pytest.mark.asyncio

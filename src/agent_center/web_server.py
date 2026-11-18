@@ -11,7 +11,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-from agent_center.config import AppConfiguration
+from agent_center.config import AppConfiguration, added_agents
 from agent_center.domain import TaskStatus
 from agent_center.engine import TaskEngine
 from agent_center.runtime.identity import verify_process_identity
@@ -44,29 +44,37 @@ class WebApplication:
             (task_id, task["pending_approval_id"]),
         ).fetchone()
         pending_approval = bool(approval and approval["status"] in {"pending", "approved"})
-        needs_review = bool(incomplete) or task["status"] in {"blocked", "interrupted", "running", "verifying"}
+        needs_review = bool(incomplete) or bool(runs) and task["status"] in {
+            "blocked", "interrupted", "running", "verifying"
+        }
         needs_review = needs_review or (
-            task["status"] == "planning" and not self.running(task_id)
+            bool(runs) and task["status"] == "planning" and not self.running(task_id)
             and task["last_error"] != "Prior effects reviewed; create a fresh plan before any new Run"
         )
         needs_review = needs_review or bool(task["pending_approval_id"] and not pending_approval)
         needs_review = needs_review or (task["status"] == "waiting_approval" and not pending_approval)
+        if pending_approval or needs_review and not runs:
+            hint = "请先在任务详情处理审批请求，再继续或取消任务。"
+        elif runs:
+            hint = (
+                "请检查 Run、日志路径和工作区变化，确认进程已停止后对账。"
+                "对账后重新规划，旧 Run 不会重放。"
+            )
+        else:
+            hint = f"{task['last_error'] or ''} 尚未启动执行。可继续让统筹模型重新规划或回复，也可取消任务。".strip()
         return {
             "needs_review": needs_review and not self.running(task_id),
             "can_resume": not self.running(task_id) and not incomplete and not needs_review and not pending_approval
-            and task["status"] in {"created", "paused", "planning"},
-            "can_reconcile": not self.running(task_id) and not pending_approval,
-            "hint": "请先在任务详情处理审批请求，再检查与对账。" if pending_approval else (
-                "请检查 Run、日志路径和工作区变化，确认进程已停止后对账。"
-                "对账后重新规划，旧 Run 不会重放。"
-            ),
+            and task["status"] in {"created", "paused", "planning", "blocked", "interrupted", "running", "verifying"},
+            "can_reconcile": bool(runs) and not self.running(task_id) and not pending_approval,
+            "hint": hint,
         }
 
     def configuration_guard(self, *, adding: bool = False) -> None:
         from agent_center.setup import ensure_configuration_editable
 
-        if any(not job.done() for job in self.jobs.values()):
-            raise ValueError("当前任务正在运行；请打开任务并暂停或停止后再修改配置")
+        if self.engine.message_lock.locked() or any(not job.done() for job in self.jobs.values()):
+            raise ValueError("当前统筹或任务正在运行；请打开任务并暂停或停止后再修改配置")
         ensure_configuration_editable(self.store, adding=adding)
 
     def update_configuration(self, config: AppConfiguration) -> None:
@@ -120,7 +128,7 @@ class WebApplication:
             raise ValueError("存在未对账的 Run，请打开对应任务，检查进程与工作区后对账")
         task = self.store.task(task_id)
         if not task or not self.recovery(task_id)["can_resume"]:
-            raise ValueError("此任务需要先检查阻塞原因，并在任务详情中确认对账后继续")
+            raise ValueError("此任务暂时不能继续，请在任务详情查看阻塞原因或处理审批")
         active = self.store.active_task()
         if active and active["task_id"] != task_id:
             raise ValueError(f"请先处理当前任务 {active['task_id']}")
@@ -140,12 +148,20 @@ class WebApplication:
 
         self.jobs[task_id] = asyncio.create_task(work())
 
+    def start_promoted(self, conversation: dict[str, Any]) -> None:
+        task_id = conversation.get("task_id")
+        if task_id:
+            try:
+                self.start(task_id)
+            except ValueError as exc:
+                self.store.set_status(task_id, TaskStatus.BLOCKED, error=redact_text(str(exc)))
+
     async def api(self, method: str, path: str, body: dict[str, Any]) -> Any:
         if method == "GET" and path == "/api/agents/health":
             from agent_center.capabilities import installation_identity, required_capabilities
 
             result = {}
-            for name, agent in self.engine.config.agents.items():
+            for name, agent in added_agents(self.engine.config).items():
                 profile = self.engine.config.profiles[agent.default_profile]
                 identity = installation_identity(agent, profile)
                 required = required_capabilities(profile.permission_mode)
@@ -175,19 +191,12 @@ class WebApplication:
             ) if k in body}
             raw = self.engine.config.model_dump(mode="json")
             raw["supervisor"] = values
-            candidate = AppConfiguration.model_validate(raw)
+            AppConfiguration.model_validate(raw)
             base_url, api_key = body.get("base_url", ""), body.get("api_key", "")
             if not isinstance(base_url, str) or not isinstance(api_key, str) or len(api_key) > 8192:
                 raise ValueError("统筹连接信息格式不正确")
-            # Validate prospective environment values before persisting anything.
-            from agent_center.config import ProfileConfig
-
-            ProfileConfig(agent_id="codex", model="", base_url=base_url)
-            updated = register_supervisor(self.engine.config, self.config_path, values)
-            if base_url.strip():
-                os.environ[candidate.supervisor.base_url_env] = base_url.strip().rstrip("/")
-            if api_key:
-                os.environ[candidate.supervisor.api_key_env] = api_key
+            updated = register_supervisor(self.engine.config, self.config_path, values,
+                                          base_url=base_url, api_key=api_key)
             self.update_configuration(updated)
             return {"saved": True}
         if method == "POST" and path == "/api/agents/models":
@@ -248,7 +257,8 @@ class WebApplication:
         if method == "GET" and path == "/api/state":
             config = self.engine.config
             return {
-                "api_revision": 3,
+                "api_revision": 4,
+                "conversations": self.store.list_conversations(),
                 "tasks": self.store.list_tasks(100),
                 "active_task_id": (self.store.active_task() or {}).get("task_id"),
                 "unresolved_task_ids": list(dict.fromkeys(r["task_id"] for r in self.store.unresolved_runs())),
@@ -263,29 +273,37 @@ class WebApplication:
                         "permission": config.profiles[a.default_profile].permission_mode,
                         "capabilities": a.capabilities.model_dump(mode="json"),
                     }
-                    for name, a in config.agents.items()
+                    for name, a in added_agents(config).items()
                 ],
                 "limits": config.limits.model_dump(),
                 "supervisor": config.supervisor.model,
                 "supervisor_settings": {
                     **config.supervisor.model_dump(exclude={"api_key_env"}),
                     "key_variable": config.supervisor.api_key_env,
-                    "address_configured": bool(os.environ.get(config.supervisor.base_url_env, "")),
-                    "key_configured": bool(os.environ.get(config.supervisor.api_key_env, "")),
+                    "address_configured": bool(config._local_connection.get(
+                        "base_url", os.environ.get(config.supervisor.base_url_env, ""))),
+                    "key_configured": bool(config._local_connection.get(
+                        "api_key", os.environ.get(config.supervisor.api_key_env, ""))),
                 },
             }
-        if method == "POST" and path == "/api/tasks":
-            goal = str(body.get("goal", "")).strip()
-            if not goal or len(goal) > 16000:
-                raise ValueError("请输入 1–16000 字的任务")
-            workspace = str(body.get("workspace", "")).strip()
-            task_id, _ = self.engine.create_task(goal, Path(workspace) if workspace else None)
-            try:
-                self.start(task_id)
-            except ValueError as exc:
-                self.store.set_status(task_id, TaskStatus.BLOCKED, error=redact_text(str(exc)))
-            return self.detail(task_id)
+        if method == "POST" and path in {"/api/messages", "/api/tasks"}:
+            # /api/tasks remains an alias, with the same mandatory pre-task route.
+            conversation = await self.engine.submit_message(
+                str(body.get("text", body.get("goal", ""))).strip(),
+                conversation_id=body.get("conversation_id"),
+                workspace=Path(str(body["workspace"])) if body.get("workspace") else None,
+            )
+            self.start_promoted(conversation)
+            return conversation
         parts = path.strip("/").split("/")
+        if len(parts) >= 3 and parts[:2] == ["api", "conversations"]:
+            if method == "GET" and len(parts) == 3:
+                return self.store.conversation(parts[2])
+            if method == "POST" and len(parts) == 4 and parts[3] == "execute":
+                conversation = self.engine.promote_message(parts[2], str(body.get("message_id", "")))
+                self.start_promoted(conversation)
+                return conversation
+            raise ValueError("请求不支持")
         if len(parts) < 3 or parts[:2] != ["api", "tasks"]:
             raise ValueError("接口不存在")
         task_id = parts[2]
@@ -295,6 +313,15 @@ class WebApplication:
         if method != "POST" or len(parts) != 4:
             raise ValueError("请求不支持")
         action = parts[3]
+        if action == "delete":
+            if body.get("confirmation") != task_id:
+                raise ValueError("请输入完整任务 ID 确认删除")
+            if self.running(task_id):
+                raise ValueError("请先停止 / 取消运行并对账，再删除任务")
+            self.store.delete_task(task_id)
+            self.jobs.pop(task_id, None)
+            self.controls.pop(task_id, None)
+            return {"deleted": task_id}
         if action == "message":
             text = str(body.get("text", "")).strip()
             if not text or len(text) > 16000:
@@ -340,7 +367,7 @@ class WebApplication:
                 if action == "cancel":
                     await self.jobs[task_id]
             elif action in {"pause", "stop"}:
-                raise ValueError("当前没有网页管理的运行；请检查任务详情并对账后继续或取消")
+                raise ValueError("当前没有网页管理的运行；请查看任务详情后继续或取消")
             if action == "cancel":
                 if self.recovery(task_id)["needs_review"] and self.store.runs(task_id):
                     raise ValueError("Run 副作用需要检查；请先在任务详情中对账，再取消")

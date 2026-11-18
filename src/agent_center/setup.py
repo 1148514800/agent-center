@@ -18,9 +18,7 @@ def registrations_path(config_path: Path) -> Path:
 
 def apply_registrations(config: AppConfiguration, config_path: Path) -> AppConfiguration:
     path = registrations_path(config_path)
-    if not path.exists():
-        return config
-    raw = json.loads(path.read_text())
+    raw = json.loads(path.read_text()) if path.exists() else {}
     if not isinstance(raw, dict) or set(raw) - {"codex", "deepseek", "supervisor"}:
         raise ValueError("Invalid registered agent data")
     if "supervisor" in raw:
@@ -31,7 +29,20 @@ def apply_registrations(config: AppConfiguration, config_path: Path) -> AppConfi
         if agent_id == "supervisor":
             continue
         config = build_registration(config, agent_id=agent_id, **values)
+    secret_path = supervisor_settings_path(config_path)
+    if secret_path.exists():
+        if secret_path.is_symlink() or secret_path.stat().st_mode & 0o077:
+            raise ValueError("统筹本地密钥文件权限必须为 0600，且不能是符号链接")
+        saved = json.loads(secret_path.read_text())
+        values = config.model_dump(mode="json")
+        values["supervisor"] = saved["supervisor"]
+        config = AppConfiguration.model_validate(values)
+        config._local_connection.update(base_url=saved["base_url"], api_key=saved["api_key"])
     return config
+
+
+def supervisor_settings_path(config_path: Path) -> Path:
+    return config_path.expanduser().with_suffix(config_path.suffix + ".supervisor.json")
 
 
 def discover_agents() -> list[dict[str, str]]:
@@ -87,6 +98,7 @@ def build_registration(
     profile_id = f"registered_{agent_id}"
     raw = config.model_dump(mode="json")
     raw["agents"][agent_id] = {
+        "user_added": True,
         "adapter": "codex_exec" if agent_id == "codex" else "deepseek_headless",
         "executable": executable,
         "description": "Registered locally; native capabilities require verification.",
@@ -105,7 +117,9 @@ def build_registration(
         "permission_mode": permission_mode,
         "credential_env": ["CODEX_HOME"] if agent_id == "codex" else ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL"],
     }
-    return AppConfiguration.model_validate(raw)
+    updated = AppConfiguration.model_validate(raw)
+    updated._local_connection.update(config._local_connection)
+    return updated
 
 
 def register_agent(
@@ -144,22 +158,38 @@ def _write_registrations(path: Path, rows: dict[str, Any]) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
 
 def register_supervisor(
-    config: AppConfiguration, config_path: Path, values: dict[str, Any]
+    config: AppConfiguration, config_path: Path, values: dict[str, Any],
+    *, base_url: str = "", api_key: str = "",
 ) -> AppConfiguration:
-    """Extend the existing local registration overlay; persist variable names, never values."""
+    """Atomically save settings and credentials in a private config-scoped sidecar."""
     raw = config.model_dump(mode="json")
     raw["supervisor"] = values
     updated = AppConfiguration.model_validate(raw)
-    path = registrations_path(config_path)
-    rows = json.loads(path.read_text()) if path.exists() else {}
-    rows["supervisor"] = updated.supervisor.model_dump(mode="json")
-    _write_registrations(path, rows)
+    updated.supervisor.validate_protocol_options()
+    address = base_url.strip() or config._local_connection.get(
+        "base_url", os.environ.get(updated.supervisor.base_url_env, ""))
+    key = api_key or config._local_connection.get("api_key", os.environ.get(updated.supervisor.api_key_env, ""))
+    from agent_center.config import ProfileConfig
+
+    try:
+        ProfileConfig(agent_id="codex", model="", base_url=address)
+    except ValueError:
+        raise ValueError("统筹地址必须是 HTTPS API 地址（本机可用 HTTP），不能包含密钥或查询参数") from None
+    _write_registrations(supervisor_settings_path(config_path), {
+        "supervisor": updated.supervisor.model_dump(mode="json"), "base_url": address, "api_key": key,
+    })
+    updated._local_connection.update(base_url=address, api_key=key)
     return updated
 
 

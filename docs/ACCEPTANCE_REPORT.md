@@ -1,5 +1,32 @@
 # Agent Center v0.1 原生沙箱架构修正验收
 
+## 2026-11-18：当前 Mac 同步树的 Linux 离线增量验证
+
+本节是本次增量工作的结果；下文 2026-11-16 的 Mac 探针记录为历史证据，本次未重跑。保留当前工作树已有提交与未提交改动，未进行从零架构替换、提交或推送。
+
+- 创建任务之前由模型返回直接回答或类型化执行意图；普通问答一次 mock 响应，无任务、Run 或执行工作区。独立会话可重启恢复；任务追加入口明确分开，受单任务 / 未对账 Run 阻塞的执行请求保留并可显式重试。
+- 删除按钮与确认 API 已实现。事务清理内部关联记录；活动 job / 执行时段、未知或未对账 Run 拒绝删除；工作区与日志文件保留。
+- 统筹模型、协议、思考强度、地址和密钥通过 config 旁的 0600 私有文件原子持久化并重新加载。密钥不进入 API 响应、浏览器 localStorage 或任务配置快照。不支持的协议 / effort 在调用前拒绝；自动值省略参数。
+- 连接面板空状态保留添加 Agent 与统筹配置入口；只展示显式新增或兼容的旧配置 Agent，安装发现不代表添加。
+- Web API revision 服务端与 UI 同步为 **4**；SQLite 增加会话表和 migration 7，TOML schema_version 仍为 1。
+
+最终命令与结果：
+
+| 检查 | 结果 |
+|---|---|
+| `uv run --locked ruff check .` | PASS |
+| `uv run --locked mypy src` | PASS，22 个源文件 |
+| `uv run --locked pytest -m 'not live'` | PASS，213 passed（新功能测试文件 37 项） |
+| `node --check src/agent_center/web/app.js` | PASS |
+| `git diff --check` | PASS |
+
+测试仅使用 httpx.MockTransport、fake / mock CLI、内存 HTTP 流及临时数据库 / 配置目录。没有真实统筹 API 请求或用户 API 配额消耗，没有启动 / 重启用户数据上的 Web 服务，没有访问用户 Mac 或真实 ~/.agent-center。未创建 Page；未进行浏览器 UI 验收，未执行或宣称 live 测试通过。
+
+边界：私有文件依靠本机文件权限保护，并非加密密钥链；第三方模型的参数兼容性及真实 GUI / 原生 Agent 联调仍未验收。一个前序测试运行中，既有 `test_process_reads_both_streams_without_deadlock` 出现一次截断断言失败；相关实现与测试未修改，后续完整运行通过，本次不宣称修复该不稳定性。
+
+---
+
+
 日期：2026-11-16（Asia/Shanghai）。环境：macOS **26.6 / 25G72 arm64**，Python 3.14.10，SQLite 3.53.1，Codex CLI 0.166.0，DeepSeek Harness 0.2.2-rc.3。
 
 **结论：架构改造及离线回归通过；完整 v0.1 验收仍 BLOCKED。真实模型项目执行及 E 端到端没有通过。** 原有未提交工作已保留，当前修改未提交、未推送。下列结果替代此前“等待自建隔离测试后端”的规划；不增加容器或 OS 沙箱。

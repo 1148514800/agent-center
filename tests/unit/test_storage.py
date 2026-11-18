@@ -103,6 +103,38 @@ def test_direct_answer_needs_verifying_status(store: Store, tmp_path: Path) -> N
     assert store.finish_if_current(task_id, 1, [evidence_id])
 
 
+def test_legacy_routing_flag_is_removed_without_losing_task_history(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    store = Store(data_dir)
+    task_id = store.create_task("修改这个页面", tmp_path, {})
+    store.add_message(task_id, "Then add tests")
+    store.apply_pending_messages(task_id)
+    store.record_call(task_id, "supervisor", 10)
+    evidence_id = store.add_evidence(task_id, 2, "supervisor", "Preserved answer")
+    store.set_status(task_id, TaskStatus.BLOCKED, error="Legacy classification rejected answer")
+    store._connection.execute("ALTER TABLE tasks ADD COLUMN execution_required INTEGER NOT NULL DEFAULT 1")
+    task = {key: value for key, value in store.task(task_id).items() if key != "execution_required"}
+    messages, events, evidence = store.messages(task_id), store.events(task_id), store.evidence(task_id)
+    store.close()
+
+    for _ in range(2):  # Migration and subsequent opens are both safe.
+        restored = Store(data_dir)
+        try:
+            assert restored.task(task_id) == task
+            assert restored.messages(task_id) == messages
+            assert restored.events(task_id) == events
+            assert restored.evidence(task_id) == evidence
+            assert not restored.has_execution_work(task_id)
+        finally:
+            restored.close()
+    restored = Store(data_dir)
+    try:
+        restored.set_status(task_id, TaskStatus.VERIFYING)
+        assert restored.finish_if_current(task_id, 2, [evidence_id])
+    finally:
+        restored.close()
+
+
 def test_direct_answer_cannot_bypass_saved_plan_criteria(store: Store, tmp_path: Path) -> None:
     from agent_center.domain import Criterion, PlanStep
 
@@ -132,8 +164,8 @@ def test_only_complete_current_evidence_can_finish(store: Store, tmp_path: Path)
     assert not store.finish_if_current(task_id, 1, [incomplete])
     current = store.add_evidence(task_id, 1, "supervisor", "answer")
     store.set_status(task_id, TaskStatus.VERIFYING)
-    assert not store.finish_if_current(task_id, 1, [current])
-    assert store.task(task_id)["status"] == TaskStatus.VERIFYING
+    assert store.finish_if_current(task_id, 1, [current])
+    assert store.task(task_id)["status"] == TaskStatus.SUCCEEDED
 
 
 def test_ambiguous_run_becomes_unknown_not_replayed(store: Store, tmp_path: Path) -> None:

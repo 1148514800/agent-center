@@ -49,6 +49,11 @@ class DirectAnswer(StrictModel):
     answer: ShortText
 
 
+class ExecutionRequest(StrictModel):
+    action: Literal["request_execution"]
+    reason_summary: ShortText
+
+
 class PlanStep(StrictModel):
     id: str = Field(min_length=1, max_length=80)
     objective: ShortText

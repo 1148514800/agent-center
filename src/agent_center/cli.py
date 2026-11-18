@@ -248,8 +248,16 @@ def _show_task(store: Store, task_id: str) -> int:
 
 
 async def _run_command(engine: TaskEngine, store: Store, goal: str, workspace: Path | None, verbose: bool) -> int:
-    task_id, task_workspace = engine.create_task(goal, workspace)
-    print(f"Task: {task_id}\nWorkspace: {task_workspace}")
+    result = await engine.submit_message(goal, workspace=workspace)
+    task_id = result.get("task_id")
+    if not task_id:
+        message = result["messages"][-1]
+        print(message["answer"] or message["reason"])
+        print(f"Conversation: {result['conversation_id']}")
+        return EXIT_OK if message["status"] == "answered" else EXIT_BLOCKED
+    created = store.task(task_id)
+    assert created is not None
+    print(f"Task: {task_id}\nWorkspace: {created['workspace']}")
 
     async def progress(event: dict[str, Any]) -> None:
         if verbose or event.get("type") != "action":
@@ -288,10 +296,12 @@ async def _run_command(engine: TaskEngine, store: Store, goal: str, workspace: P
 async def _chat(engine: TaskEngine, store: Store, workspace: Path | None, verbose: bool) -> int:
     session: PromptSession[str] = PromptSession()
     current_task: str | None = None
+    conversation_id: str | None = None
     run_task: asyncio.Task[str] | None = None
     cancel = asyncio.Event()
     pause = asyncio.Event()
-    print("Chat: enter a request; /status /plan /logs /ask TEXT /add TEXT /stop /pause /resume /quit")
+    print("Chat: /status /plan /logs /ask TEXT /add TEXT /new /stop /pause /resume /quit; "
+          "plain text is a separate conversation question")
 
     async def progress(event: dict[str, Any]) -> None:
         msg = event.get("reason") or event.get("type") or "progress"
@@ -301,9 +311,18 @@ async def _chat(engine: TaskEngine, store: Store, workspace: Path | None, verbos
             print(f"\n[{event.get('action')}] {msg}")
 
     async def start_task(goal: str) -> None:
-        nonlocal current_task, run_task, cancel, pause
-        current_task, task_workspace = engine.create_task(goal, workspace)
-        print(f"Task {current_task}; workspace {task_workspace}")
+        nonlocal current_task, conversation_id, run_task, cancel, pause
+        result = await engine.submit_message(goal, conversation_id=conversation_id, workspace=workspace)
+        conversation_id = result["conversation_id"]
+        if not result.get("task_id"):
+            message = result["messages"][-1]
+            print(message["answer"] or message["reason"])
+            print(f"Conversation {conversation_id}; request saved. Use /add to append to the selected task.")
+            return
+        current_task = result["task_id"]
+        created = store.task(current_task)
+        assert created is not None
+        print(f"Task {current_task}; workspace {created['workspace']}")
         cancel = asyncio.Event()
         pause = asyncio.Event()
         run_task = asyncio.create_task(
@@ -324,7 +343,11 @@ async def _chat(engine: TaskEngine, store: Store, workspace: Path | None, verbos
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await run_task
             return EXIT_OK
-        if current_task is None and not text.startswith("/"):
+        if text == "/new":
+            conversation_id = None
+            print("New conversation; existing task is preserved. /add explicitly appends to it.")
+            continue
+        if not text.startswith("/"):
             await start_task(text)
             continue
         if current_task is None:

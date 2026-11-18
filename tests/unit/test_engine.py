@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from typing import Any
@@ -18,8 +19,10 @@ from agent_center.storage.database import Store
 class FakeModel:
     def __init__(self, actions: list[Any]):
         self.actions = actions
+        self.contexts: list[dict[str, Any]] = []
 
-    async def decide(self, **_: Any) -> Any:
+    async def decide(self, **kwargs: Any) -> Any:
+        self.contexts.append(json.loads(kwargs["user"]))
         return self.actions.pop(0)
 
     async def answer_question(self, **_: Any) -> str:
@@ -249,3 +252,118 @@ def test_single_task_guard_does_not_create_orphan_workspaces(config: AppConfigur
         engine.create_task("Second")
     assert set(workspace.parent.iterdir()) == before
     assert len(store.list_tasks()) == 1
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_greeting_finishes_in_one_decision_preserving_history(
+    config: AppConfiguration, store: Store, tmp_path: Path, historical: bool
+) -> None:
+    model = FakeModel([DirectAnswer(action="answer", reason_summary="Greeting", answer="你好！")])
+    engine = TaskEngine(config, store, model_client=model)
+    task_id, _ = engine.create_task("你好", tmp_path)
+    old_evidence = []
+    if historical:
+        store._connection.execute(
+            "UPDATE tasks SET supervisor_calls=5,active_seconds=12,status='blocked',"
+            "last_error='Multiple tool calls in one response are not supported' WHERE task_id=?", (task_id,)
+        )
+        store.add_evidence(task_id, 1, "supervisor", "Preserved prior evidence", complete=False)
+        old_evidence = store.evidence(task_id)
+    assert asyncio.run(engine.run_task(task_id)) == "你好！"
+    task = store.task(task_id)
+    assert task["status"] == TaskStatus.SUCCEEDED
+    assert task["supervisor_calls"] == (6 if historical else 1)
+    assert task["agent_calls"] == 0
+    assert task["active_seconds"] >= (12 if historical else 0)
+    assert "execution_required" not in task
+    assert not store.runs(task_id)
+    assert len(model.contexts) == 1
+    assert sum(e["type"] == "supervisor_call_reserved" for e in store.events(task_id)) == 1
+    assert all(row in store.evidence(task_id) for row in old_evidence)
+    assert store.evidence(task_id)[-1]["summary"] == "你好！"
+
+
+@pytest.mark.parametrize("history", ["plan", "past_plan", "agent_calls", "completed_run", "reconciled_run"])
+def test_saved_execution_work_requires_verification_with_one_feedback_retry(
+    config: AppConfiguration, store: Store, tmp_path: Path, history: str
+) -> None:
+    answer = DirectAnswer(action="answer", reason_summary="Claiming completion", answer="All done")
+    model = FakeModel([answer, answer, answer])
+    engine = TaskEngine(config, store, model_client=model)
+    task_id, _ = engine.create_task("你好", tmp_path)
+    if history == "agent_calls":
+        store.record_call(task_id, "agent", 12)
+    if history in {"plan", "past_plan", "completed_run", "reconciled_run"}:
+        store.update_plan(task_id, [{"id": "s", "objective": "synthetic", "acceptance_criteria": [
+            {"id": "c", "description": "synthetic", "verification_argv": []}
+        ]}], 1)
+        if history in {"completed_run", "reconciled_run"}:
+            run_id = store.create_run(task_id, "codex", "synthetic", {}, tmp_path / "stdout.log", {}, 1)
+            store.mark_run(run_id, "completed" if history == "completed_run" else "reconciled")
+            # Isolate the run guard from the separate plan-history guard.
+            store._connection.execute("UPDATE tasks SET plan_json='[]',criteria_json='[]' WHERE task_id=?", (task_id,))
+            store._connection.execute("DELETE FROM events WHERE task_id=? AND type='plan_updated'", (task_id,))
+        elif history == "past_plan":
+            store.add_message(task_id, "谢谢")  # Applying this clears the current plan.
+    result = asyncio.run(engine.run_task(task_id))
+    assert "Direct answer cannot complete" in result
+    task = store.task(task_id)
+    assert task["status"] == TaskStatus.BLOCKED
+    assert task["supervisor_calls"] == 2
+    assert len(model.contexts) == 2 and len(model.actions) == 1
+    assert "Direct answer cannot complete" in model.contexts[1]["additional"]
+    assert not store.evidence(task_id)
+    # The storage completion gate must agree with the engine even with supervisor evidence.
+    evidence = store.add_evidence(task_id, task["requirements_version"], "supervisor", "fake success")
+    store.set_status(task_id, TaskStatus.VERIFYING)
+    assert not store.finish_if_current(task_id, task["requirements_version"], [evidence])
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_multi_action_protocol_retries_without_applying_any_batch_action(
+    config: AppConfiguration, store: Store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repeat: bool
+) -> None:
+    import httpx
+
+    from agent_center.supervisor import TOOL_DEFINITIONS, ModelClient
+
+    monkeypatch.setenv("AGENT_CENTER_BASE_URL", "https://synthetic.invalid/v1")
+    monkeypatch.setenv("AGENT_CENTER_API_KEY", "SYNTHETIC_PROTOCOL_TEST_VALUE")
+    names = [tool["function"]["name"] for tool in TOOL_DEFINITIONS]
+    requests = []
+    task_id = store.create_task("你好", tmp_path, {})
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 2:
+            assert store.task(task_id)["status"] == TaskStatus.PLANNING
+            assert not store.runs(task_id) and not store.evidence(task_id)
+            feedback = json.loads(requests[-1]["messages"][-1]["content"])["additional"]
+            assert all(name in feedback for name in names)
+            assert "exactly one tool call or a direct answer" in feedback
+            if not repeat:
+                return httpx.Response(200, json={"choices": [{"message": {"content": "你好！"}}]})
+        # Arguments are deliberately invalid and contain a canary: none may be applied or logged.
+        return httpx.Response(200, json={"choices": [{"message": {"tool_calls": [
+            {"function": {"name": name, "arguments": "PRIVATE_ARGUMENT_CANARY"}} for name in names
+        ]}}]})
+
+    model = ModelClient(config, transport=httpx.MockTransport(respond))
+    result = asyncio.run(TaskEngine(config, store, model_client=model).run_task(task_id))
+    task = store.task(task_id)
+    assert len(requests) == task["supervisor_calls"] == 2
+    assert task["agent_calls"] == 0
+    assert task["status"] == (TaskStatus.BLOCKED if repeat else TaskStatus.SUCCEEDED)
+    if repeat:
+        assert all(name in task["last_error"] for name in names)
+        assert "Multiple tool calls" in result
+    events = store.events(task_id)
+    errors = [json.loads(e["payload"]) for e in events if e["type"] == "supervisor_protocol_error"]
+    assert len(errors) == (2 if repeat else 1)
+    assert errors[0]["tool_names"] == names and errors[0]["count"] == len(names)
+    assert errors[0]["feedback_retry"] is True
+    if repeat:
+        assert errors[1]["feedback_retry"] is False
+    assert "PRIVATE_ARGUMENT_CANARY" not in json.dumps(events)
+    assert not store.runs(task_id) and not json.loads(task["plan_json"])
+    assert not store._connection.execute("SELECT 1 FROM approvals WHERE task_id=?", (task_id,)).fetchone()

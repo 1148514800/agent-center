@@ -286,7 +286,7 @@ async def test_paused_task_with_history_allows_new_agent_but_not_replacement(
 
 
 @pytest.mark.asyncio
-async def test_supervisor_overlay_updates_running_clients_without_persisting_connection_values(
+async def test_supervisor_settings_persist_private_connection_values(
     config: AppConfiguration, store: Store, executable: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from agent_center.setup import register_supervisor
@@ -297,18 +297,20 @@ async def test_supervisor_overlay_updates_running_clients_without_persisting_con
     monkeypatch.setenv("TEST_SUPERVISOR_ADDRESS", "")
     monkeypatch.setenv("TEST_SUPERVISOR_CREDENTIAL", "")
     values = {"protocol": "openai_chat_completions", "base_url_env": "TEST_SUPERVISOR_ADDRESS",
-              "api_key_env": "TEST_SUPERVISOR_CREDENTIAL", "model": "synthetic-model",
+              "api_key_env": "TEST_SUPERVISOR_CREDENTIAL", "model": "gpt-5",
               "reasoning_effort": "high", "max_output_tokens": 2048, "request_timeout_seconds": 60}
     assert (await app.api("POST", "/api/supervisor", {**values, "base_url": "https://synthetic.invalid/v1",
                                                      "api_key": "synthetic-session-value"}))["saved"]
     assert app.engine.model.config is app.engine.config is app.engine.verifier.config
     assert app.engine.config.supervisor_endpoint() == (
-        "https://synthetic.invalid/v1", "synthetic-session-value", "synthetic-model"
+        "https://synthetic.invalid/v1", "synthetic-session-value", "gpt-5"
     )
-    persisted = registrations_path(path).read_text()
-    assert "synthetic-session-value" not in persisted and "https://synthetic.invalid" not in persisted
+    from agent_center.setup import supervisor_settings_path
+
+    persisted = supervisor_settings_path(path).read_text()
+    assert "synthetic-session-value" in persisted and "https://synthetic.invalid" in persisted
     assert not path.exists()
-    assert registrations_path(path).stat().st_mode & 0o777 == 0o600
+    assert supervisor_settings_path(path).stat().st_mode & 0o777 == 0o600
     state = redact_value(await app.api("GET", "/api/state", {}))
     assert state["supervisor_settings"]["key_variable"] == "TEST_SUPERVISOR_CREDENTIAL"
     assert state["supervisor_settings"]["key_configured"]
@@ -316,14 +318,14 @@ async def test_supervisor_overlay_updates_running_clients_without_persisting_con
     # Preserve existing agent rows when saving the supervisor, and vice versa.
     await app.api("POST", "/api/agents", {"agent_id": "codex", "executable": str(executable),
                                           "model": "synthetic-agent", "replace": True})
-    register_supervisor(app.engine.config, path, {**values, "model": "updated"})
+    register_supervisor(app.engine.config, path, {**values, "model": "o3"})
     restored = apply_registrations(config, path)
-    assert restored.supervisor.model == "updated"
+    assert restored.supervisor.model == "o3"
     assert restored.profiles["registered_codex"].model == "synthetic-agent"
     # Base TOML remains intact when present.
     path.write_bytes(Path("config.example.toml").read_bytes())
     original = path.read_bytes()
-    assert load_config(path).supervisor.model == "updated"
+    assert load_config(path).supervisor.model == "o3"
     assert path.read_bytes() == original
 
 
